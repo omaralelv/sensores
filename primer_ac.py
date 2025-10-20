@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
 from pathlib import Path
+import gc
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -195,26 +196,23 @@ def id_solo(valor: str) -> str:
     return coincidencia.group(1) if coincidencia else str(valor).strip()
 
 
-def load_map_file(uploaded) -> pd.DataFrame | None:
-    if uploaded is None:
+@st.cache_data(show_spinner=False, max_entries=8)
+def load_map_file(data: bytes, filename: str) -> pd.DataFrame | None:
+    if not data:
         return None
+    buffer = io.BytesIO(data)
     try:
-        uploaded.seek(0)
+        if filename.lower().endswith(".csv"):
+            df = pd.read_csv(buffer)
+        elif filename.lower().endswith(".xlsx") or filename.lower().endswith(".xlsm") or filename.lower().endswith(".xls"):
+            df = pd.read_excel(buffer)
+        else:
+            # Intento adicional: separador ';'
+            buffer.seek(0)
+            df = pd.read_csv(buffer, sep=";")
     except Exception:
-        pass
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            return pd.read_csv(uploaded)
-        return pd.read_excel(uploaded)
-    except Exception:
-        try:
-            uploaded.seek(0)
-        except Exception:
-            pass
-        try:
-            return pd.read_csv(uploaded, sep=";")
-        except Exception:
-            return None
+        return None
+    return optimizar_dataframe(df)
 
 
 def dividir_grupos(
@@ -2280,6 +2278,10 @@ def main() -> None:
     with st.sidebar:
         st.header("Panel de configuraciones")
 
+        if st.button("Liberar caché de datos", help="Borra los datos cacheados para reducir el uso de memoria"):
+            st.cache_data.clear()
+            gc.collect()
+
         mostrar_config_sensores = st.checkbox("Mostrar configuración de sensores", value=False, key="toggle_config_sensores")
         if mostrar_config_sensores:
             st.subheader("Sensores incluidos")
@@ -2338,7 +2340,10 @@ def main() -> None:
         )
         if modo_niveles == "Automático (archivo)":
             map_file = st.file_uploader("Archivo CSV/XLSX de niveles", type=["csv", "xlsx"], key="map_file")
-            df_map_override = load_map_file(map_file)
+            if map_file is not None:
+                df_map_override = load_map_file(map_file.getvalue(), map_file.name)
+            else:
+                df_map_override = None
             st.caption("Columnas sugeridas: sensor_id, level, height")
         elif modo_niveles == "Manual":
             sensores_para_niveles = list(dict.fromkeys(sel_temp + sel_hum))
@@ -2586,6 +2591,7 @@ def main() -> None:
             analisis_divisiones if analisis_divisiones else None,
             contextos_division,
         )
+    gc.collect()
 
 
 if __name__ == "__main__":
