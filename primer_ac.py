@@ -14,6 +14,7 @@ import gc
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from matplotlib import transforms
 from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
@@ -447,6 +448,7 @@ def resaltar_periodo_prueba(
     color_estabilizacion: str = "#b0bec5",
     alpha_prueba: float = 0.14,
     alpha_estabilizacion: float = 0.05,
+    anotar: bool = False,
 ) -> None:
     if t_ini is None or t_fin is None:
         return
@@ -458,13 +460,44 @@ def resaltar_periodo_prueba(
     if pd.isna(t_min) or pd.isna(t_max):
         return
 
-    ax.axvspan(t_ini, t_fin, color=color_span, alpha=alpha_prueba)
+    if t_fin > t_ini:
+        x_prueba_span = ax.axvspan(t_ini, t_fin, color=color_span, alpha=alpha_prueba, label="Periodo de prueba")
+    else:
+        x_prueba_span = None
     estabilizacion = None
     if t_fin < t_max:
-        estabilizacion = ax.axvspan(t_fin, t_max, color=color_estabilizacion, alpha=alpha_estabilizacion)
+        estabilizacion = ax.axvspan(t_fin, t_max, color=color_estabilizacion, alpha=alpha_estabilizacion, label="Estabilización")
+
+    if anotar and t_fin > t_ini:
+        trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+        x_prueba = t_ini + (t_fin - t_ini) / 2
+        ax.text(
+            x_prueba,
+            0.95,
+            "Periodo de prueba",
+            color=color_span,
+            fontsize=9,
+            fontweight="bold",
+            ha="center",
+            va="top",
+            alpha=0.85,
+            transform=trans,
+        )
+        if estabilizacion is not None and t_fin < t_max:
+            x_est = t_fin + (t_max - t_fin) / 2
+            ax.text(
+                x_est,
+                0.95,
+                "Estabilización",
+                color="#4a4a4a",
+                fontsize=9,
+                ha="center",
+                va="top",
+                alpha=0.75,
+                transform=trans,
+            )
 
     handles, labels = ax.get_legend_handles_labels()
-    # No añadir parches extra a la leyenda para mantener la misma escala visual.
     if handles:
         legend_kwargs = legend_kwargs or {}
         ax.legend(handles, labels, **legend_kwargs)
@@ -1795,6 +1828,7 @@ def plot_prueba_sensor_principal(analisis: AnalisisPrueba, titulo_contexto: str 
         analisis.t_fin_clip,
         color_span="tab:orange",
         legend_kwargs={"loc": "upper left"},
+        anotar=True,
     )
     fig.tight_layout()
     return fig
@@ -2004,6 +2038,7 @@ def _grafico_prueba_full(
         t_fin,
         color_span=color_span,
         legend_kwargs={"bbox_to_anchor": (1.02, 1), "loc": "upper left", "borderaxespad": 0.},
+        anotar=True,
     )
     ax.grid(True, axis="x", alpha=0.15)
     fig.tight_layout(rect=[0, 0, 0.85, 1])
@@ -2544,17 +2579,17 @@ def main() -> None:
         )
 
         st.markdown("### Tendencia de temperatura con ventana de prueba")
-        if (ti_temp is not None) and (tf_temp is not None) and sel_temp:
-            fig_temp_full = grafico_temp_prueba_full(
-                df_temp,
-                sel_temp,
-                ti_temp,
-                tf_temp,
-                decimales_report,
-                titulo_contexto=contexto_general,
-                lineas_umbral=lineas_temp_general,
-            )
-            if fig_temp_full is not None:
+    if (ti_temp is not None) and (tf_temp is not None) and sel_temp:
+        fig_temp_full = grafico_temp_prueba_full(
+            df_temp,
+            sel_temp,
+            ti_temp,
+            tf_temp,
+            decimales_report,
+            titulo_contexto=contexto_general,
+            lineas_umbral=lineas_temp_general,
+        )
+        if fig_temp_full is not None:
                 st.pyplot(fig_temp_full)
                 plt.close(fig_temp_full)
 
