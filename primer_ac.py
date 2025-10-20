@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable
+from pathlib import Path
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -21,6 +23,10 @@ import streamlit as st
 # Configuración global
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Reportes de Sensores", layout="wide")
+mpl_config_dir = Path(os.environ.get("MPLCONFIGDIR", "/tmp/mplconfig"))
+mpl_config_dir.mkdir(parents=True, exist_ok=True)
+os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
+
 sns.set_theme(style="whitegrid")
 
 DEFAULT_TEMP_SHEET_HINT = "tem"
@@ -67,6 +73,33 @@ def _hampel(series: pd.Series, window: int = 7, n_sigmas: float = 3.0) -> pd.Ser
     mad = 1.4826 * (datos - mediana).abs().rolling(window, center=True, min_periods=1).median()
     umbral = n_sigmas * mad.replace(0, np.nan)
     return datos.mask((datos - mediana).abs() > umbral)
+
+
+def optimizar_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce el uso de memoria mediante downcasting y categorización ligera."""
+    optim = df.copy()
+    # Downcast de floats e ints
+    for col in optim.select_dtypes(include=["float64", "float32"]).columns:
+        optim[col] = pd.to_numeric(optim[col], downcast="float")
+    for col in optim.select_dtypes(include=["int64", "int32", "int"]).columns:
+        optim[col] = pd.to_numeric(optim[col], downcast="integer")
+    # Convertir columnas con poca cardinalidad a categoría
+    for col in optim.select_dtypes(include=["object"]).columns:
+        n_vals = len(optim[col])
+        if n_vals == 0:
+            continue
+        ratio = optim[col].nunique(dropna=True) / n_vals
+        if ratio < 0.5:
+            optim[col] = optim[col].astype("category")
+    return optim
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cargar_dataframe_cache(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """Lee, limpia y optimiza una hoja de Excel, almacenando el resultado en caché."""
+    df_raw = read_excel_sheet(file_bytes, sheet_name)
+    df_clean = limpiar_dataframe(df_raw)
+    return optimizar_dataframe(df_clean)
 
 def fmt_num(valor, decimales: int) -> str:
     if valor is None:
@@ -431,37 +464,6 @@ def resaltar_periodo_prueba(
     estabilizacion = None
     if t_fin < t_max:
         estabilizacion = ax.axvspan(t_fin, t_max, color=color_estabilizacion, alpha=alpha_estabilizacion)
-
-    ylim = ax.get_ylim()
-    if t_fin > t_ini:
-        y_text = ylim[1] - (ylim[1] - ylim[0]) * 0.06
-        x_prueba = t_ini + (t_fin - t_ini) / 2
-        ax.text(
-            x_prueba,
-            y_text,
-            "Periodo de Prueba",
-            color=color_span,
-            fontsize=9,
-            fontweight="bold",
-            ha="center",
-            va="top",
-            alpha=0.9,
-        )
-        if estabilizacion is not None:
-            dur_est = t_max - t_fin
-            if pd.notna(dur_est) and dur_est > pd.Timedelta(0):
-                x_est = t_fin + dur_est / 2
-                ax.text(
-                    x_est,
-                    y_text,
-                    "Estabilización",
-                    color="#4a4a4a",
-                    fontsize=9,
-                    fontweight="bold",
-                    ha="center",
-                    va="top",
-                    alpha=0.85,
-                )
 
     handles, labels = ax.get_legend_handles_labels()
     # No añadir parches extra a la leyenda para mantener la misma escala visual.
@@ -2241,18 +2243,15 @@ def main() -> None:
             sheet_hum = st.selectbox("Hoja de humedad", sheets, index=default_index(DEFAULT_HUM_SHEET_HINT))
 
     try:
-        df_temp_raw = read_excel_sheet(file_bytes, sheet_temp)
+        df_temp = cargar_dataframe_cache(file_bytes, sheet_temp)
         if incluir_humedad and sheet_hum is not None:
-            df_hum_raw = read_excel_sheet(file_bytes, sheet_hum)
+            df_hum = cargar_dataframe_cache(file_bytes, sheet_hum)
         else:
-            df_hum_raw = pd.DataFrame(columns=["Timestamp"])
+            df_hum = pd.DataFrame(columns=["Timestamp"])
     except Exception as exc:
         st.error(f"No fue posible leer las hojas seleccionadas: {exc}")
         safe_stop()
         return
-
-    df_temp = limpiar_dataframe(df_temp_raw)
-    df_hum = limpiar_dataframe(df_hum_raw) if incluir_humedad and not df_hum_raw.empty else df_hum_raw.copy()
 
     sensores_temp = detectar_sensores(df_temp, {"Timestamp", "Fecha", "Hora"})
     sensores_hum = detectar_sensores(df_hum, {"Timestamp", "Fecha", "Hora"}) if incluir_humedad else []
