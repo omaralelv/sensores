@@ -2579,53 +2579,54 @@ def main() -> None:
         )
 
         st.markdown("### Tendencia de temperatura con ventana de prueba")
-    if (ti_temp is not None) and (tf_temp is not None) and sel_temp:
-        fig_temp_full = grafico_temp_prueba_full(
-            df_temp,
-            sel_temp,
-            ti_temp,
-            tf_temp,
-            decimales_report,
-            titulo_contexto=contexto_general,
-            lineas_umbral=lineas_temp_general,
-        )
-        if fig_temp_full is not None:
+
+        if (ti_temp is not None) and (tf_temp is not None) and sel_temp:
+            fig_temp_full = grafico_temp_prueba_full(
+                df_temp,
+                sel_temp,
+                ti_temp,
+                tf_temp,
+                decimales_report,
+                titulo_contexto=contexto_general,
+                lineas_umbral=lineas_temp_general,
+            )
+            if fig_temp_full is not None:
                 st.pyplot(fig_temp_full)
                 plt.close(fig_temp_full)
 
-        st.markdown("### Tendencia de humedad con ventana de prueba")
-        if (ti_hum is not None) and (tf_hum is not None) and sel_hum:
-            fig_hum_full = grafico_hum_prueba_full(
-                df_hum,
-                sel_hum,
-                ti_hum,
-                tf_hum,
-                decimales_report,
-                titulo_contexto=contexto_general,
-                lineas_umbral=lineas_hum_general,
-            )
-            if fig_hum_full is not None:
-                st.pyplot(fig_hum_full)
-                plt.close(fig_hum_full)
+            st.markdown("### Tendencia de humedad con ventana de prueba")
+            if (ti_hum is not None) and (tf_hum is not None) and sel_hum:
+                fig_hum_full = grafico_hum_prueba_full(
+                    df_hum,
+                    sel_hum,
+                    ti_hum,
+                    tf_hum,
+                    decimales_report,
+                    titulo_contexto=contexto_general,
+                    lineas_umbral=lineas_hum_general,
+                )
+                if fig_hum_full is not None:
+                    st.pyplot(fig_hum_full)
+                    plt.close(fig_hum_full)
 
-        analisis_prueba = None
-        analisis_divisiones: dict[str, AnalisisPrueba] = {}
-        if ti_temp is not None and tf_temp is not None:
-            analisis_prueba = analizar_prueba(df_temp, sel_temp, ti_temp, tf_temp, umbral_temp, tipo_limite)
-            if grupos_temp:
-                for clave, sensores_grupo in grupos_temp.items():
-                    if not sensores_grupo:
-                        continue
-                    analisis_div = analizar_prueba(df_temp, sensores_grupo, ti_temp, tf_temp, umbral_temp, tipo_limite)
-                    if analisis_div is not None:
-                        analisis_divisiones[clave] = analisis_div
-        render_prueba_umbrales(
-            analisis_prueba,
-            decimales_report,
-            contexto_general,
-            analisis_divisiones if analisis_divisiones else None,
-            contextos_division,
-        )
+            analisis_prueba = None
+            analisis_divisiones: dict[str, AnalisisPrueba] = {}
+            if ti_temp is not None and tf_temp is not None:
+                analisis_prueba = analizar_prueba(df_temp, sel_temp, ti_temp, tf_temp, umbral_temp, tipo_limite)
+                if grupos_temp:
+                    for clave, sensores_grupo in grupos_temp.items():
+                        if not sensores_grupo:
+                            continue
+                        analisis_div = analizar_prueba(df_temp, sensores_grupo, ti_temp, tf_temp, umbral_temp, tipo_limite)
+                        if analisis_div is not None:
+                            analisis_divisiones[clave] = analisis_div
+            render_prueba_umbrales(
+                analisis_prueba,
+                decimales_report,
+                contexto_general,
+                analisis_divisiones if analisis_divisiones else None,
+                contextos_division,
+            )
     gc.collect()
 
 
