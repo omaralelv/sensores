@@ -67,6 +67,12 @@ def safe_stop() -> None:
 def to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
+
+def _widget_key(prefix: str, titulo: str, contexto: str) -> str:
+    """Genera claves únicas y estables para widgets Streamlit."""
+    base = f"{prefix}_{titulo}_{contexto}"
+    return re.sub(r"\W+", "_", base).lower()
+
 def _hampel(series: pd.Series, window: int = 7, n_sigmas: float = 3.0) -> pd.Series:
     datos = to_numeric(series)
     if datos.empty:
@@ -561,7 +567,7 @@ def filtrar_rango(
 
 def _interp_at(ts: pd.Series, serie: pd.Series, t_ref: pd.Timestamp) -> float:
     x = pd.to_datetime(ts).values.astype("datetime64[ns]").astype("int64")
-    y = pd.to_numeric(serie, errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(serie, errors="coerce").to_numpy(dtype=np.float32)
     mask = np.isfinite(y)
     x, y = x[mask], y[mask]
     if len(x) == 0:
@@ -581,7 +587,7 @@ def _interp_at(ts: pd.Series, serie: pd.Series, t_ref: pd.Timestamp) -> float:
 
 
 def _first_cross_time(series: pd.Series, ts: pd.Series, umbral: float, tipo: str, mask: pd.Series | None = None) -> pd.Timestamp | None:
-    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float32)
     t = pd.to_datetime(ts).to_numpy()
     if mask is not None:
         mask_np = mask.to_numpy()
@@ -609,7 +615,7 @@ def _first_cross_time(series: pd.Series, ts: pd.Series, umbral: float, tipo: str
 
 
 def _tiempo_fuera(series: pd.Series, ts: pd.Series, umbral: float, tipo: str, mask: pd.Series | None = None) -> float:
-    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float32)
     t = pd.to_datetime(ts).to_numpy()
     if mask is not None:
         mask_np = mask.to_numpy()
@@ -627,7 +633,7 @@ def _tiempo_fuera(series: pd.Series, ts: pd.Series, umbral: float, tipo: str, ma
 
 
 def _first_cross_down_after(series: pd.Series, ts: pd.Series, umbral: float, t_ref: pd.Timestamp) -> pd.Timestamp | None:
-    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float32)
     t = pd.to_datetime(ts).to_numpy()
     n = len(t)
     if n < 2:
@@ -819,7 +825,7 @@ def analizar_promedio(df: pd.DataFrame, sensores: list[str]) -> PromedioAnalisis
     if promedio.dropna().empty:
         return None
 
-    valores_np = valores.to_numpy(dtype=float, copy=False)
+    valores_np = valores.to_numpy(dtype=np.float32, copy=False)
     mask_valid = np.isfinite(valores_np)
     if not mask_valid.any():
         return None
@@ -1220,7 +1226,7 @@ def _resumen_generico(
     )
 
     valores = datos[sensores].apply(to_numeric)
-    valores_np = valores.to_numpy(dtype=float, copy=False)
+    valores_np = valores.to_numpy(dtype=np.float32, copy=False)
     if np.isfinite(valores_np).any():
         promedio_general = float(np.nanmean(valores_np))
         max_global = float(np.nanmax(valores_np))
@@ -1570,6 +1576,7 @@ def render_bloque(
     titulo_contexto: str = "",
     lineas_umbral: list[tuple[float, str]] | None = None,
     aplicar_umbrales: bool = True,
+    key_suffix: str | None = None,
 ) -> None:
     if df.empty or not sensores:
         st.info(f"Sin datos de {nombre.lower()} para mostrar.")
@@ -1604,55 +1611,83 @@ def render_bloque(
     st.text(_tabla_texto(titulo_max, tabla_max, columnas))
     st.text(_tabla_texto(titulo_min, tabla_min, columnas))
 
-    titulo_box = titulo_con_contexto(f"Distribución de {nombre.lower()} por sensor", titulo_contexto)
-    fig_box = grafico_boxplot(df, sensores, titulo_box, unidad, lineas_umbral=None)
-    st.pyplot(fig_box)
-    plt.close(fig_box)
+    key_base = key_suffix or f"{nombre}_{titulo_contexto or 'general'}"
+    st.caption("Activa los gráficos que necesites; se generan al momento y consumen memoria adicional.")
 
-    titulo_tend = titulo_con_contexto(f"Tendencia de {nombre.lower()}", titulo_contexto)
-    fig_trend = grafico_tendencias(
-        df,
-        sensores,
-        titulo_tend,
-        unidad,
-        lineas_umbral=lineas_umbral if aplicar_umbrales else None,
+    mostrar_boxplot = st.checkbox(
+        "Mostrar boxplot por sensor",
+        value=False,
+        key=_widget_key("boxplot", nombre, key_base),
     )
-    st.pyplot(fig_trend)
-    plt.close(fig_trend)
+    if mostrar_boxplot:
+        titulo_box = titulo_con_contexto(f"Distribución de {nombre.lower()} por sensor", titulo_contexto)
+        fig_box = grafico_boxplot(df, sensores, titulo_box, unidad, lineas_umbral=None)
+        st.pyplot(fig_box)
+        plt.close(fig_box)
 
-    analisis = analizar_promedio(df, sensores)
-    if analisis and not stats.stats.empty:
-        titulo_dest = titulo_con_contexto(f"Sensores destacados ({nombre.lower()})", titulo_contexto)
-        fig_dest = grafico_destacados(
+    mostrar_tendencia = st.checkbox(
+        "Mostrar tendencia completa",
+        value=False,
+        key=_widget_key("tendencia", nombre, key_base),
+    )
+    if mostrar_tendencia:
+        titulo_tend = titulo_con_contexto(f"Tendencia de {nombre.lower()}", titulo_contexto)
+        fig_trend = grafico_tendencias(
             df,
-            stats,
-            analisis,
-            titulo_dest,
+            sensores,
+            titulo_tend,
             unidad,
-            lineas_umbral=None,
+            lineas_umbral=lineas_umbral if aplicar_umbrales else None,
         )
-        st.pyplot(fig_dest)
-        plt.close(fig_dest)
-        titulo_prom = titulo_con_contexto(f"Promedio general de {nombre.lower()}", titulo_contexto)
-        fig_avg = grafico_promedio_intervalos(
-            df,
-            analisis,
-            titulo_prom,
-            unidad,
-            lineas_umbral=None,
-        )
-        st.pyplot(fig_avg)
-        plt.close(fig_avg)
-        st.caption(
-            " | ".join(
-                [
-                    f"Percentil 99: {fmt_num(analisis.p99, decimales)}{unidad}",
-                    f"Percentil 1: {fmt_num(analisis.p01, decimales)}{unidad}",
-                    f"Máximo global: {fmt_num(analisis.max_val, decimales)}{unidad}",
-                    f"Mínimo global: {fmt_num(analisis.min_val, decimales)}{unidad}",
-                ]
-            )
-        )
+        st.pyplot(fig_trend)
+        plt.close(fig_trend)
+
+    mostrar_destacados = st.checkbox(
+        "Mostrar sensores destacados",
+        value=False,
+        key=_widget_key("destacados", nombre, key_base),
+    )
+    mostrar_promedio = st.checkbox(
+        "Mostrar promedio general e intervalos",
+        value=False,
+        key=_widget_key("promedio", nombre, key_base),
+    )
+    if (mostrar_destacados or mostrar_promedio) and not stats.stats.empty:
+        analisis = analizar_promedio(df, sensores)
+        if analisis:
+            if mostrar_destacados:
+                titulo_dest = titulo_con_contexto(f"Sensores destacados ({nombre.lower()})", titulo_contexto)
+                fig_dest = grafico_destacados(
+                    df,
+                    stats,
+                    analisis,
+                    titulo_dest,
+                    unidad,
+                    lineas_umbral=None,
+                )
+                st.pyplot(fig_dest)
+                plt.close(fig_dest)
+            if mostrar_promedio:
+                titulo_prom = titulo_con_contexto(f"Promedio general de {nombre.lower()}", titulo_contexto)
+                fig_avg = grafico_promedio_intervalos(
+                    df,
+                    analisis,
+                    titulo_prom,
+                    unidad,
+                    lineas_umbral=None,
+                )
+                st.pyplot(fig_avg)
+                plt.close(fig_avg)
+                st.caption(
+                    " | ".join(
+                        [
+                            f"Percentil 99: {fmt_num(analisis.p99, decimales)}{unidad}",
+                            f"Percentil 1: {fmt_num(analisis.p01, decimales)}{unidad}",
+                            f"Máximo global: {fmt_num(analisis.max_val, decimales)}{unidad}",
+                            f"Mínimo global: {fmt_num(analisis.min_val, decimales)}{unidad}",
+                        ]
+                    )
+                )
 
 
 def render_seccion(
@@ -1693,6 +1728,7 @@ def render_seccion(
         contexto_general,
         lineas_temp,
         aplicar_umbrales=True,
+        key_suffix=f"{titulo}_temp_general",
     )
 
     if grupos_temp:
@@ -1712,6 +1748,7 @@ def render_seccion(
                     contexto_grupo,
                     lineas_temp,
                     aplicar_umbrales=False,
+                    key_suffix=f"{titulo}_temp_{grupo_nombre}",
                 )
 
     if mostrar_humedad and sensores_hum:
@@ -1729,6 +1766,7 @@ def render_seccion(
             contexto_general,
             lineas_hum,
             aplicar_umbrales=bool(lineas_hum),
+            key_suffix=f"{titulo}_hum_general",
         )
 
         if grupos_hum:
@@ -1748,6 +1786,7 @@ def render_seccion(
                         contexto_grupo,
                         lineas_hum,
                         aplicar_umbrales=False,
+                        key_suffix=f"{titulo}_hum_{grupo_nombre}",
                     )
 
     bloques_mapeo = construir_bloques_mapeo(
