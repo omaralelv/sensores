@@ -819,37 +819,29 @@ def analizar_promedio(df: pd.DataFrame, sensores: list[str]) -> PromedioAnalisis
     if promedio.dropna().empty:
         return None
 
+    valores_np = valores.to_numpy(dtype=float, copy=False)
+    mask_valid = np.isfinite(valores_np)
+    if not mask_valid.any():
+        return None
+
     p99 = float(promedio.quantile(PERCENTIL_ALTO))
     p01 = float(promedio.quantile(PERCENTIL_BAJO))
 
-    flat = valores.stack(dropna=False)
-    if flat.dropna().empty:
-        return None
+    max_val = float(np.nanmax(valores_np))
+    min_val = float(np.nanmin(valores_np))
 
-    max_val = float(flat.max())
-    min_val = float(flat.min())
-    idx_max = flat.idxmax()
-    idx_min = flat.idxmin()
+    max_flat_idx = int(np.nanargmax(valores_np))
+    min_flat_idx = int(np.nanargmin(valores_np))
+    max_row, _ = np.unravel_index(max_flat_idx, valores_np.shape)
+    min_row, _ = np.unravel_index(min_flat_idx, valores_np.shape)
 
-    def _ts_from_idx(idx) -> pd.Timestamp:
-        if idx is None or (isinstance(idx, float) and pd.isna(idx)):
+    def _ts_from_row(row_idx: int) -> pd.Timestamp:
+        if not (0 <= row_idx < len(df)):
             return pd.NaT
-        if isinstance(idx, tuple):
-            fila = idx[0]
-        else:
-            fila = idx
-        if fila in df.index:
-            return pd.to_datetime(df.loc[fila, "Timestamp"], errors="coerce")
-        try:
-            pos = int(fila)
-        except Exception:
-            return pd.NaT
-        if 0 <= pos < len(df):
-            return pd.to_datetime(df.iloc[pos]["Timestamp"], errors="coerce")
-        return pd.NaT
+        return pd.to_datetime(df.iloc[row_idx].get("Timestamp"), errors="coerce")
 
-    ts_max = _ts_from_idx(idx_max)
-    ts_min = _ts_from_idx(idx_min)
+    ts_max = _ts_from_row(max_row)
+    ts_min = _ts_from_row(min_row)
 
     intervalos_altos = _intervalos_contiguos(df["Timestamp"], promedio >= p99)
     intervalos_bajos = _intervalos_contiguos(df["Timestamp"], promedio <= p01)
@@ -1228,12 +1220,16 @@ def _resumen_generico(
     )
 
     valores = datos[sensores].apply(to_numeric)
-    flat = valores.stack(dropna=False)
-    promedio_general = float(flat.mean()) if not flat.dropna().empty else np.nan
-    max_global = float(flat.max()) if not flat.dropna().empty else np.nan
-    min_global = float(flat.min()) if not flat.dropna().empty else np.nan
-    reps_max = int(np.isclose(valores, max_global, equal_nan=False).sum().sum()) if np.isfinite(max_global) else 0
-    reps_min = int(np.isclose(valores, min_global, equal_nan=False).sum().sum()) if np.isfinite(min_global) else 0
+    valores_np = valores.to_numpy(dtype=float, copy=False)
+    if np.isfinite(valores_np).any():
+        promedio_general = float(np.nanmean(valores_np))
+        max_global = float(np.nanmax(valores_np))
+        min_global = float(np.nanmin(valores_np))
+        reps_max = int(np.isclose(valores_np, max_global, equal_nan=False).sum()) if np.isfinite(max_global) else 0
+        reps_min = int(np.isclose(valores_np, min_global, equal_nan=False).sum()) if np.isfinite(min_global) else 0
+    else:
+        promedio_general = max_global = min_global = np.nan
+        reps_max = reps_min = 0
 
     dif_max_instantanea = np.nan
     if not valores.dropna(how="all").empty:
