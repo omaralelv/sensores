@@ -39,6 +39,8 @@ PERCENTIL_BAJO = 0.01
 DEFAULT_DECIMALES = 1
 PLOT_SMOOTH_WINDOW = 5
 PLOT_DIFF_QUANTILE = 0.995
+CROSS_MARGIN = 0.1  # margen adicional para considerar un cruce fuera del umbral
+DEFAULT_FIGSIZE = (16, 6.5)
 
 
 class PruebaTipo:
@@ -521,9 +523,9 @@ def filtrar_rango(
         if valor is None or valor == "":
             return fallback
         if isinstance(valor, (pd.Timestamp, datetime)):
-            return pd.to_datetime(valor, errors="coerce")
+            return pd.to_datetime(valor, errors="coerce", dayfirst=True)
         if isinstance(valor, tuple) and len(valor) == 2:
-            return pd.to_datetime(valor[0], errors="coerce")
+            return pd.to_datetime(valor[0], errors="coerce", dayfirst=True)
         if isinstance(valor, str):
             texto = valor.strip()
             if not texto:
@@ -532,23 +534,20 @@ def filtrar_rango(
             if ts_custom is not None:
                 return ts_custom
             formatos = [
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %H:%M",
-                "%Y-%m-%d",
                 "%d-%m-%Y %H:%M:%S",
                 "%d-%m-%Y %H:%M",
                 "%d-%m-%Y",
+                "%d/%m/%Y %H:%M:%S",
+                "%d/%m/%Y %H:%M",
+                "%d/%m/%Y",
             ]
             for fmt in formatos:
                 try:
-                    return pd.to_datetime(texto, format=fmt, errors="raise")
+                    return pd.to_datetime(texto, format=fmt, errors="raise", dayfirst=True)
                 except Exception:
                     continue
-            ts = pd.to_datetime(texto, errors="coerce", dayfirst=True)
-            if pd.isna(ts):
-                ts = pd.to_datetime(texto, errors="coerce")
-            return ts
-        return pd.to_datetime(valor, errors="coerce")
+            return pd.to_datetime(texto, errors="coerce", dayfirst=True)
+        return pd.to_datetime(valor, errors="coerce", dayfirst=True)
 
     ti = _to_timestamp(fecha_ini, df["Timestamp"].min())
     tf = _to_timestamp(fecha_fin, df["Timestamp"].max())
@@ -596,40 +595,77 @@ def _first_cross_time(series: pd.Series, ts: pd.Series, umbral: float, tipo: str
     if len(t) < 2:
         return None
     if tipo == PruebaTipo.MAX:
-        a = y[:-1] <= umbral
-        b = y[1:] > umbral
+        umbral_cruce = umbral + CROSS_MARGIN
+        a = y[:-1] < umbral_cruce
+        b = y[1:] >= umbral_cruce
     else:
-        a = y[:-1] >= umbral
-        b = y[1:] < umbral
+        umbral_cruce = umbral - CROSS_MARGIN
+        a = y[:-1] > umbral_cruce
+        b = y[1:] <= umbral_cruce
     idx = np.where(a & b)[0]
     if idx.size == 0:
         return None
     i = int(idx[0])
-    y0, y1 = y[i], y[i + 1]
-    t0, t1 = pd.Timestamp(t[i]), pd.Timestamp(t[i + 1])
-    if np.isfinite(y0) and np.isfinite(y1) and (y1 != y0):
-        frac = (umbral - y0) / (y1 - y0)
-        frac = float(min(max(frac, 0.0), 1.0))
-        return t0 + (t1 - t0) * frac
-    return t0
+    t1 = pd.Timestamp(t[i + 1])
+    return t1
 
 
 def _tiempo_fuera(series: pd.Series, ts: pd.Series, umbral: float, tipo: str, mask: pd.Series | None = None) -> float:
+    intervalos = _intervalos_fuera(series, ts, umbral, tipo, mask)
+    return float(sum(d for _, _, d in intervalos))
+
+
+def _intervalos_fuera(
+    series: pd.Series,
+    ts: pd.Series,
+    umbral: float,
+    tipo: str,
+    mask: pd.Series | None = None,
+) -> list[tuple[pd.Timestamp, pd.Timestamp, float]]:
     y = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float32)
     t = pd.to_datetime(ts).to_numpy()
     if mask is not None:
         mask_np = mask.to_numpy()
         y = y[mask_np]
         t = t[mask_np]
-    if len(t) < 2:
-        return 0.0
-    fuera = (y > umbral) if tipo == PruebaTipo.MAX else (y < umbral)
-    dt_sec = np.diff(t.astype("datetime64[ns]")).astype("timedelta64[s]").astype(float)
-    if dt_sec.size == 0:
-        return 0.0
-    fuera_left = fuera[:-1]
-    total_seconds = dt_sec[fuera_left].sum()
-    return float(total_seconds) / 3600.0
+    n = len(t)
+    if n == 0:
+        return []
+    if tipo == PruebaTipo.MAX:
+        umbral_cruce = umbral + CROSS_MARGIN
+        fuera = y >= umbral_cruce
+    else:
+        umbral_cruce = umbral - CROSS_MARGIN
+        fuera = y <= umbral_cruce
+
+    intervalos: list[tuple[pd.Timestamp, pd.Timestamp, float]] = []
+    inicio: pd.Timestamp | None = None
+
+    for i in range(n - 1):
+        y0, y1 = y[i], y[i + 1]
+        t0 = pd.Timestamp(t[i])
+        t1 = pd.Timestamp(t[i + 1])
+
+        if not fuera[i] and fuera[i + 1]:
+            inicio = t1
+
+        if fuera[i] and inicio is None:
+            inicio = t0
+
+        if fuera[i] and not fuera[i + 1] and inicio is not None:
+            fin = t1
+            dur_h = (fin - inicio).total_seconds() / 3600.0
+            if dur_h > 0:
+                intervalos.append((inicio, fin, dur_h))
+            inicio = None
+
+    if inicio is not None:
+        fin = pd.Timestamp(t[-1])
+        dur_h = (fin - inicio).total_seconds() / 3600.0
+        if dur_h > 0:
+            intervalos.append((inicio, fin, dur_h))
+
+    return intervalos
 
 
 def _first_cross_down_after(series: pd.Series, ts: pd.Series, umbral: float, t_ref: pd.Timestamp) -> pd.Timestamp | None:
@@ -645,9 +681,10 @@ def _first_cross_down_after(series: pd.Series, ts: pd.Series, umbral: float, t_r
         if not (np.isfinite(y0) and np.isfinite(y1)):
             continue
         t0, t1 = pd.Timestamp(t[i]), pd.Timestamp(t[i + 1])
-        if (y0 > umbral) and (y1 <= umbral):
+        umbral_cruce = umbral + CROSS_MARGIN
+        if (y0 >= umbral_cruce) and (y1 < umbral_cruce):
             if y1 != y0:
-                frac = (umbral - y0) / (y1 - y0)
+                frac = (umbral_cruce - y0) / (y1 - y0)
                 frac = float(min(max(frac, 0.0), 1.0))
                 t_cross = t0 + (t1 - t0) * frac
             else:
@@ -1148,47 +1185,34 @@ def _compactar_eventos_valor(
 ) -> list[dict]:
     if df.empty or not sensores or not np.isfinite(objetivo):
         return []
-    registros: list[dict] = []
+    filas: list[dict] = []
     data = df.sort_values("Timestamp")
-    for _, row in data.iterrows():
-        ts = row["Timestamp"]
-        sensores_match = []
-        for sensor in sensores:
-            val = pd.to_numeric(row.get(sensor), errors="coerce")
-            if pd.notna(val) and abs(val - objetivo) <= tolerancia:
-                sensores_match.append(sensor)
-        if sensores_match:
-            registros.append(
+    for sensor in sensores:
+        serie = pd.to_numeric(data.get(sensor), errors="coerce")
+        mask = serie.notna() & (serie.sub(objetivo).abs() <= tolerancia)
+        if not mask.any():
+            continue
+        eventos = data.loc[mask, ["Timestamp"]].copy()
+        eventos[columna_valor] = serie[mask]
+        grupos = (
+            eventos["Timestamp"].diff().fillna(pd.Timedelta(0))
+            > pd.Timedelta(minutes=intervalo_minutos)
+        ).cumsum()
+        for _, bloque in eventos.groupby(grupos):
+            ts_ini = bloque["Timestamp"].iloc[0]
+            ts_fin = bloque["Timestamp"].iloc[-1]
+            filas.append(
                 {
-                    "Timestamp": ts,
-                    columna_valor: float(pd.to_numeric(row[sensores_match[0]], errors="coerce")),
-                    "sensores": tuple(sorted(set(sensores_match))),
+                    "fecha_inicio": format_date_es(ts_ini),
+                    "hora_inicio": ts_ini.strftime("%H:%M:%S"),
+                    "fecha_fin": format_date_es(ts_fin),
+                    "hora_fin": ts_fin.strftime("%H:%M:%S"),
+                    columna_valor: fmt_num(bloque[columna_valor].iloc[0], decimales),
+                    "n_registros": bloque.shape[0],
+                    "n_sensores": 1,
+                    "sensores": sensor,
                 }
             )
-    if not registros:
-        return []
-    eventos = pd.DataFrame(registros).sort_values("Timestamp")
-    grupos = (
-        eventos["Timestamp"].diff().fillna(pd.Timedelta(0))
-        > pd.Timedelta(minutes=intervalo_minutos)
-    ).cumsum()
-    filas: list[dict] = []
-    for _, bloque in eventos.groupby(grupos):
-        ts_ini = bloque["Timestamp"].iloc[0]
-        ts_fin = bloque["Timestamp"].iloc[-1]
-        sensores_bloque = sorted({sid for grupo in bloque["sensores"] for sid in grupo})
-        filas.append(
-            {
-                "fecha_inicio": format_date_es(ts_ini),
-                "hora_inicio": ts_ini.strftime("%H:%M:%S"),
-                "fecha_fin": format_date_es(ts_fin),
-                "hora_fin": ts_fin.strftime("%H:%M:%S"),
-                columna_valor: fmt_num(bloque[columna_valor].iloc[0], decimales),
-                "n_registros": bloque.shape[0],
-                "n_sensores": len(sensores_bloque),
-                "sensores": ", ".join(sensores_bloque),
-            }
-        )
     return filas
 
 
@@ -1326,7 +1350,7 @@ def grafico_boxplot(
     datos = df[columnas].apply(to_numeric, result_type="broadcast") if columnas else pd.DataFrame()
     datos = datos.dropna(axis=1, how="all").dropna(how="all")
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     if datos.empty:
         ax.axis("off")
         ax.text(
@@ -1360,7 +1384,7 @@ def grafico_tendencias(
     mostrar_promedio: bool = True,
     lineas_umbral: list[tuple[float, str]] | None = None,
 ) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     ts = df["Timestamp"]
     for sensor in sensores:
         serie_plot = _series_for_plot(df[sensor])
@@ -1390,7 +1414,7 @@ def grafico_destacados(
     unidad: str,
     lineas_umbral: list[tuple[float, str]] | None = None,
 ) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     ts = df["Timestamp"]
     sensores = [s for s in stats.stats["Sensor"].tolist() if s in df.columns]
 
@@ -1438,7 +1462,7 @@ def grafico_promedio_intervalos(
     unidad: str,
     lineas_umbral: list[tuple[float, str]] | None = None,
 ) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     ts = df["Timestamp"]
     promedio = analisis.promedio
 
@@ -1482,10 +1506,13 @@ class AnalisisPrueba:
     t_fin_clip: pd.Timestamp
     cruces: dict[str, pd.Timestamp]
     tiempos_fuera: dict[str, float]
+    intervalos_fuera: dict[str, list[tuple[pd.Timestamp, pd.Timestamp, float]]]
+    cruces_down_after: dict[str, pd.Timestamp]
+    cruces_down_last: dict[str, pd.Timestamp]
+    retardos_horas: dict[str, float]
+    retardos_horas_last: dict[str, float]
     sensor_primero: str | None
     t_primera: pd.Timestamp | None
-    cruces_down_after: dict[str, pd.Timestamp]
-    retardos_horas: dict[str, float]
     sensor_baja_primero: str | None
     sensor_baja_ultimo: str | None
     t_baja_primero: pd.Timestamp | None
@@ -1516,33 +1543,42 @@ def analizar_prueba(
 
     cruces: dict[str, pd.Timestamp] = {}
     tiempos_fuera: dict[str, float] = {}
+    intervalos_fuera: dict[str, list[tuple[pd.Timestamp, pd.Timestamp, float]]] = {}
     for sensor in sensores:
         if sensor not in data.columns:
             continue
         serie = data[sensor]
-        t_cross = _first_cross_time(serie, data["Timestamp"], umbral, tipo, mask_rango)
-        if t_cross is not None:
-            cruces[sensor] = t_cross
-        tiempos_fuera[sensor] = _tiempo_fuera(serie, data["Timestamp"], umbral, tipo, mask_rango)
+        intervalos_rango = _intervalos_fuera(serie, data["Timestamp"], umbral, tipo, mask_rango)
+        intervalos_fuera[sensor] = intervalos_rango
+        tiempos_fuera[sensor] = float(sum(d for _, _, d in intervalos_rango))
+        if intervalos_rango:
+            cruces[sensor] = intervalos_rango[0][0]
 
     sensor_primero = min(cruces, key=cruces.get) if cruces else None
     t_primera = cruces.get(sensor_primero) if sensor_primero else None
 
     t_ref = t_fin_clip
     cruces_down_after: dict[str, pd.Timestamp] = {}
+    cruces_down_last: dict[str, pd.Timestamp] = {}
     retardos_horas: dict[str, float] = {}
+    retardos_horas_last: dict[str, float] = {}
     for sensor in sensores:
         if sensor not in data.columns:
             continue
-        t_cross = _first_cross_down_after(data[sensor], data["Timestamp"], umbral, t_ref)
-        if t_cross is not None:
-            cruces_down_after[sensor] = t_cross
-            retardos_horas[sensor] = (t_cross - t_ref).total_seconds() / 3600.0
+        intervalos_full = _intervalos_fuera(data[sensor], data["Timestamp"], umbral, tipo)
+        t_cross_candidates = [fin for (_, fin, _) in intervalos_full if fin >= t_ref]
+        if t_cross_candidates:
+            t_cross_first = min(t_cross_candidates)
+            t_cross_last = max(t_cross_candidates)
+            cruces_down_after[sensor] = t_cross_first
+            cruces_down_last[sensor] = t_cross_last
+            retardos_horas[sensor] = (t_cross_first - t_ref).total_seconds() / 3600.0
+            retardos_horas_last[sensor] = (t_cross_last - t_ref).total_seconds() / 3600.0
 
     sensor_baja_primero = min(cruces_down_after, key=cruces_down_after.get) if cruces_down_after else None
-    sensor_baja_ultimo = max(cruces_down_after, key=cruces_down_after.get) if cruces_down_after else None
+    sensor_baja_ultimo = max(cruces_down_last, key=cruces_down_last.get) if cruces_down_last else None
     t_baja_primero = cruces_down_after.get(sensor_baja_primero) if sensor_baja_primero else None
-    t_baja_ultimo = cruces_down_after.get(sensor_baja_ultimo) if sensor_baja_ultimo else None
+    t_baja_ultimo = cruces_down_last.get(sensor_baja_ultimo) if sensor_baja_ultimo else None
 
     return AnalisisPrueba(
         df_contexto=data,
@@ -1555,10 +1591,13 @@ def analizar_prueba(
         t_fin_clip=t_fin_clip,
         cruces=cruces,
         tiempos_fuera=tiempos_fuera,
+        intervalos_fuera=intervalos_fuera,
+        cruces_down_last=cruces_down_last,
         sensor_primero=sensor_primero,
         t_primera=t_primera,
         cruces_down_after=cruces_down_after,
         retardos_horas=retardos_horas,
+        retardos_horas_last=retardos_horas_last,
         sensor_baja_primero=sensor_baja_primero,
         sensor_baja_ultimo=sensor_baja_ultimo,
         t_baja_primero=t_baja_primero,
@@ -1807,6 +1846,7 @@ def plot_prueba_sensor_principal(analisis: AnalisisPrueba, titulo_contexto: str 
     if not analisis.sensor_primero or analisis.t_primera is None:
         return None
     sensor = analisis.sensor_primero
+    umbral_line = analisis.umbral + CROSS_MARGIN if analisis.tipo == PruebaTipo.MAX else analisis.umbral - CROSS_MARGIN
     data = analisis.df_contexto.sort_values("Timestamp")
     ts = data["Timestamp"]
     y = to_numeric(data[sensor])
@@ -1814,13 +1854,22 @@ def plot_prueba_sensor_principal(analisis: AnalisisPrueba, titulo_contexto: str 
     y_ini = _interp_at(ts, y, analisis.t_ini_clip)
     y_fin = _interp_at(ts, y, analisis.t_fin_clip)
 
-    fig, ax = plt.subplots(figsize=(14.5, 6.5))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     ax.plot(ts, y_plot, label=sensor, linewidth=1.2)
     mask_rango = analisis.mask_rango.reindex(data.index, fill_value=False)
     ax.plot(ts[mask_rango], y_plot[mask_rango], linewidth=2.6, alpha=0.95)
 
-    ax.axhline(analisis.umbral, linestyle=":", linewidth=1.6)
-    ax.text(ts.iloc[0], analisis.umbral, f"  Umbral = {fmt_num(analisis.umbral, DEFAULT_DECIMALES)}", va="bottom")
+    ax.axhline(umbral_line, linestyle=":", linewidth=1.6)
+    ax.text(
+        0.01,
+        0.98,
+        f"Umbral cruce = {fmt_num(umbral_line, DEFAULT_DECIMALES)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.7),
+    )
     ax.axvline(analisis.t_ini_clip, linestyle="--", linewidth=1.2)
     ax.axvline(analisis.t_fin_clip, linestyle="--", linewidth=1.2)
 
@@ -1884,7 +1933,7 @@ def plot_prueba_rango(analisis: AnalisisPrueba, titulo_contexto: str = "") -> pl
     t1 = min(analisis.t_fin_clip + pad, ts.max())
     mask_zoom = (ts >= t0) & (ts <= t1)
 
-    fig, ax = plt.subplots(figsize=(14, 5.5))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     for sensor in sensores_zoom:
         serie_plot = _series_for_plot(data[sensor])
         ax.plot(ts[mask_zoom], serie_plot[mask_zoom], linewidth=1.6, label=sensor)
@@ -1943,14 +1992,24 @@ def plot_prueba_descenso(analisis: AnalisisPrueba, titulo_contexto: str = "") ->
 
     data = analisis.df_contexto.sort_values("Timestamp")
     ts = data["Timestamp"]
+    umbral_line = analisis.umbral + CROSS_MARGIN if analisis.tipo == PruebaTipo.MAX else analisis.umbral - CROSS_MARGIN
 
-    fig, ax = plt.subplots(figsize=(14.5, 6.5))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     for sensor in sensores:
         serie_plot = _series_for_plot(data[sensor])
         ax.plot(ts, serie_plot, linewidth=1.6, label=sensor)
 
-    ax.axhline(analisis.umbral, linestyle=":", linewidth=1.6)
-    ax.text(ts.min(), analisis.umbral, f"  Umbral = {fmt_num(analisis.umbral, DEFAULT_DECIMALES)}", va="bottom")
+    ax.axhline(umbral_line, linestyle=":", linewidth=1.6)
+    ax.text(
+        0.01,
+        0.98,
+        f"Umbral cruce = {fmt_num(umbral_line, DEFAULT_DECIMALES)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.7),
+    )
     ax.axvline(analisis.t_ini_clip, linestyle="--", linewidth=1.2)
     ax.axvline(analisis.t_fin_clip, linestyle="--", linewidth=1.2)
 
@@ -2020,7 +2079,7 @@ def _grafico_prueba_full(
         return None
 
     ts = data["Timestamp"]
-    fig, ax = plt.subplots(figsize=(14.5, 6.5))
+    fig, ax = plt.subplots(figsize=DEFAULT_FIGSIZE)
     for sensor in sensores:
         if sensor not in data.columns:
             continue
@@ -2042,14 +2101,18 @@ def _grafico_prueba_full(
         if not np.isfinite(y_val):
             return
         ax.scatter([punto], [y_val], s=55, zorder=5, color=color_span)
-        lado = "right" if etiqueta == "Fin" else "left"
-        dx = 12 if lado == "right" else -12
+        if etiqueta == "Fin":
+            dx = -12
+            ha = "right"
+        else:
+            dx = 12
+            ha = "left"
         ax.annotate(
             f"{etiqueta}\n{format_datetime_es(punto, include_seconds=False)}\n{fmt_num(y_val, decimales)}{unidad}",
             xy=(punto, y_val),
             xytext=(dx, 18),
             textcoords="offset points",
-            ha="left" if lado == "right" else "right",
+            ha=ha,
             va="bottom",
             fontsize=9,
             bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.85),
@@ -2164,12 +2227,13 @@ def _render_prueba_umbrales_detalle(
     division_label: str,
 ) -> None:
     fmt = lambda valor: fmt_num(valor, decimales)
+    umbral_cruce = analisis.umbral + CROSS_MARGIN if analisis.tipo == PruebaTipo.MAX else analisis.umbral - CROSS_MARGIN
 
     st.markdown(f"**División analizada:** {division_label}")
     st.caption(
         " | ".join(
             [
-                f"Umbral = {fmt(analisis.umbral)} °C",
+                f"Umbral = {fmt(analisis.umbral)} °C (cruce desde {fmt(umbral_cruce)} °C)",
                 "Condición: mayor que" if analisis.tipo == PruebaTipo.MAX else "Condición: menor que",
                 f"Periodo: {format_datetime_es(analisis.t_ini_clip, include_seconds=False)} → {format_datetime_es(analisis.t_fin_clip, include_seconds=False)}",
             ]
@@ -2240,12 +2304,17 @@ def _render_prueba_umbrales_detalle(
         orden = [
             (s, analisis.cruces_down_after[s], analisis.retardos_horas.get(s, 0.0))
             for s in analisis.cruces_down_after
-            if analisis.retardos_horas.get(s, 0.0) > 0
+            if analisis.retardos_horas.get(s, 0.0) >= 0
         ]
         orden.sort(key=lambda x: x[1])
         if orden:
             s_first, t_first, d_first = orden[0]
-            s_last, t_last, d_last = orden[-1]
+            if analisis.cruces_down_last:
+                s_last = max(analisis.cruces_down_last, key=analisis.cruces_down_last.get)
+                t_last = analisis.cruces_down_last[s_last]
+                d_last = analisis.retardos_horas_last.get(s_last, 0.0)
+            else:
+                s_last, t_last, d_last = orden[-1]
             resumen = [
                 f"Periodos de análisis: {format_datetime_es(analisis.t_ini_clip, include_seconds=False)} → {format_datetime_es(analisis.t_fin_clip, include_seconds=False)}",
                 f"Umbral evaluado: {fmt(analisis.umbral)} °C",
