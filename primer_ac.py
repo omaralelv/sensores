@@ -2101,22 +2101,40 @@ def _grafico_prueba_full(
         if not np.isfinite(y_val):
             return
         ax.scatter([punto], [y_val], s=55, zorder=5, color=color_span)
-        if etiqueta == "Fin":
+        x_min, x_max = ax.get_xlim()
+        y_min, y_max = ax.get_ylim()
+        x_val = mdates.date2num(punto)
+        x_rel = 0.5 if x_max == x_min else (x_val - x_min) / (x_max - x_min)
+        y_rel = 0.5 if y_max == y_min else (y_val - y_min) / (y_max - y_min)
+        if x_rel <= 0.15:
+            dx = 12
+            ha = "left"
+        elif x_rel >= 0.85:
             dx = -12
             ha = "right"
         else:
-            dx = 12
-            ha = "left"
+            dx = 12 if etiqueta == "Inicio" else -12
+            ha = "left" if etiqueta == "Inicio" else "right"
+        if y_rel >= 0.85:
+            dy = -18
+            va = "top"
+        elif y_rel <= 0.15:
+            dy = 18
+            va = "bottom"
+        else:
+            dy = 18
+            va = "bottom"
         ax.annotate(
             f"{etiqueta}\n{format_datetime_es(punto, include_seconds=False)}\n{fmt_num(y_val, decimales)}{unidad}",
             xy=(punto, y_val),
-            xytext=(dx, 18),
+            xytext=(dx, dy),
             textcoords="offset points",
             ha=ha,
-            va="bottom",
+            va=va,
             fontsize=9,
             bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.85),
             arrowprops=dict(arrowstyle="->", lw=1),
+            clip_on=True,
         )
 
     _anotar(t_ini, "Inicio")
@@ -2258,21 +2276,27 @@ def _render_prueba_umbrales_detalle(
         plt.close(fig_descenso)
 
     filas = []
-    for sensor, horas in analisis.tiempos_fuera.items():
-        t_cruce = analisis.cruces.get(sensor)
-        if t_cruce is None or not (np.isfinite(horas) and horas > 0):
-            continue
-        filas.append(
-            {
-                "Sensor": sensor,
-                "Primer cruce": t_cruce,
-                "Tiempo fuera (h)": horas,
-                "Tiempo fuera": fmt_hm(horas),
-            }
-        )
+    data_ctx = analisis.df_contexto.sort_values("Timestamp")
+    ts_ctx = data_ctx["Timestamp"]
+    series_ctx = {sensor: to_numeric(data_ctx[sensor]) for sensor in analisis.intervalos_fuera if sensor in data_ctx.columns}
+    for sensor, intervalos in analisis.intervalos_fuera.items():
+        serie = series_ctx.get(sensor)
+        for t_ini_ev, t_fin_ev, horas in intervalos:
+            if not (np.isfinite(horas) and horas > 0):
+                continue
+            val_cruce = _interp_at(ts_ctx, serie, t_ini_ev) if serie is not None else np.nan
+            filas.append(
+                {
+                    "Sensor": sensor,
+                    "Salida": t_ini_ev,
+                    "Temp cruce": val_cruce,
+                    "Tiempo fuera (h)": horas,
+                    "Tiempo fuera": fmt_hm(horas),
+                }
+            )
     tabla_fuera = pd.DataFrame(filas)
     if not tabla_fuera.empty:
-        tabla_fuera = tabla_fuera.sort_values("Primer cruce")
+        tabla_fuera = tabla_fuera.sort_values("Salida")
         primero = tabla_fuera.iloc[0]
         ultimo = tabla_fuera.iloc[-1]
         t_inicio = analisis.t_ini_clip
@@ -2280,27 +2304,35 @@ def _render_prueba_umbrales_detalle(
         filas_salida = [
             {
                 "Sensor": fila["Sensor"],
-                "Salida": format_datetime_es(pd.to_datetime(fila["Primer cruce"], errors="coerce"), include_seconds=False),
+                "Salida": format_datetime_es(pd.to_datetime(fila["Salida"], errors="coerce"), include_seconds=False),
+                "Temp cruce": fmt_num(fila["Temp cruce"], decimales),
                 "Δ fuera": fmt_hm(fila["Tiempo fuera (h)"]),
-                "Δ inicio": fmt_hm((pd.to_datetime(fila["Primer cruce"], errors="coerce") - t_inicio).total_seconds() / 3600.0) if pd.notna(t_inicio) else "",
+                "Δ inicio": fmt_hm((pd.to_datetime(fila["Salida"], errors="coerce") - t_inicio).total_seconds() / 3600.0) if pd.notna(t_inicio) else "",
             }
             for _, fila in tabla_fuera.iterrows()
         ]
         resumen_fuera = [
             f"Periodos de análisis: {format_datetime_es(t_inicio, include_seconds=False)} → {format_datetime_es(t_fin, include_seconds=False)}",
             f"Umbral evaluado: {fmt(analisis.umbral)} °C",
-            f"Primero en salir: {primero['Sensor']} ({format_datetime_es(pd.to_datetime(primero['Primer cruce'], errors='coerce'), include_seconds=False)})",
-            f"Último en salir: {ultimo['Sensor']} ({format_datetime_es(pd.to_datetime(ultimo['Primer cruce'], errors='coerce'), include_seconds=False)})",
+            f"Primero en salir: {primero['Sensor']} ({format_datetime_es(pd.to_datetime(primero['Salida'], errors='coerce'), include_seconds=False)})",
+            f"Último en salir: {ultimo['Sensor']} ({format_datetime_es(pd.to_datetime(ultimo['Salida'], errors='coerce'), include_seconds=False)})",
             "",
             _tabla_texto(
                 "Tiempo fuera del límite por sensor",
                 filas_salida,
-                ["Sensor", "Salida", "Δ fuera", "Δ inicio"],
+                ["Sensor", "Salida", "Temp cruce", "Δ fuera", "Δ inicio"],
             ),
         ]
         st.text("\n".join(resumen_fuera))
 
     if analisis.cruces_down_after:
+        data_ctx = analisis.df_contexto.sort_values("Timestamp")
+        ts_ctx = data_ctx["Timestamp"]
+        series_ctx = {
+            sensor: to_numeric(data_ctx[sensor])
+            for sensor in analisis.cruces_down_after
+            if sensor in data_ctx.columns
+        }
         orden = [
             (s, analisis.cruces_down_after[s], analisis.retardos_horas.get(s, 0.0))
             for s in analisis.cruces_down_after
@@ -2327,11 +2359,15 @@ def _render_prueba_umbrales_detalle(
                         {
                             "Sensor": s,
                             "Regreso": format_datetime_es(t_cross, include_seconds=False),
+                            "Temp regreso": fmt_num(
+                                _interp_at(ts_ctx, series_ctx.get(s), t_cross) if series_ctx.get(s) is not None else np.nan,
+                                decimales,
+                            ),
                             "Δ regreso": fmt_hm(delay),
                         }
                         for s, t_cross, delay in orden
                     ],
-                    ["Sensor", "Regreso", "Δ regreso"],
+                    ["Sensor", "Regreso", "Temp regreso", "Δ regreso"],
                 ),
             ]
             st.text("\n".join(resumen))
