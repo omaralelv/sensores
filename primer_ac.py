@@ -7,11 +7,13 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from typing import Any, Iterable
 from pathlib import Path
 import gc
 
 import matplotlib.dates as mdates
+from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib import transforms
@@ -39,8 +41,10 @@ PERCENTIL_BAJO = 0.01
 DEFAULT_DECIMALES = 1
 PLOT_SMOOTH_WINDOW = 5
 PLOT_DIFF_QUANTILE = 0.995
-CROSS_MARGIN = 0.1  # margen adicional para considerar un cruce fuera del umbral
+CROSS_MARGIN = 0.001  # margen adicional para considerar un cruce fuera del umbral
 DEFAULT_FIGSIZE = (16, 6.5)
+MAX_TIME_TICKS = 8
+COMPACT_LEGEND_THRESHOLD = 8
 
 
 class PruebaTipo:
@@ -401,6 +405,176 @@ def matplotlib_date_formatter(include_seconds: bool = False) -> mdates.Formatter
     return FuncFormatter(_formatter)
 
 
+def _time_span(ts: pd.Series) -> pd.Timedelta:
+    ts_validos = pd.to_datetime(ts, errors="coerce").dropna()
+    if ts_validos.empty:
+        return pd.Timedelta(0)
+    return ts_validos.max() - ts_validos.min()
+
+
+def _timestamp_tick_es(dt: pd.Timestamp | datetime | None, span: pd.Timedelta, include_year: bool) -> str:
+    if dt is None or pd.isna(dt):
+        return ""
+    ts = pd.to_datetime(dt)
+    hora_fmt = "%H:%M:%S" if span <= pd.Timedelta(hours=1) else "%H:%M"
+    if span <= pd.Timedelta(hours=12):
+        return ts.strftime(hora_fmt)
+    if span <= pd.Timedelta(days=3):
+        return f"{ts.day:02d}-{MESES_ES_CORTO[ts.month - 1]} {ts.strftime(hora_fmt)}"
+    fecha = f"{ts.day:02d}-{MESES_ES_CORTO[ts.month - 1]}"
+    return f"{fecha}-{ts.year}" if include_year else fecha
+
+
+def matplotlib_compact_date_formatter(ts: pd.Series) -> mdates.Formatter:
+    ts_validos = pd.to_datetime(ts, errors="coerce").dropna()
+    span = _time_span(ts_validos)
+    include_year = (not ts_validos.empty) and ts_validos.dt.year.nunique() > 1
+
+    def _formatter(value, _):
+        dt = mdates.num2date(value)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return _timestamp_tick_es(pd.Timestamp(dt), span, include_year)
+
+    return FuncFormatter(_formatter)
+
+
+def _legend_columns(total_items: int) -> int:
+    if total_items <= 16:
+        return 2
+    if total_items <= 24:
+        return 3
+    return 4
+
+
+def _is_priority_legend_label(label: str) -> bool:
+    label_norm = str(label or "").strip().lower()
+    if not label_norm:
+        return False
+    prioridades = (
+        "promedio",
+        "umbral",
+        "máximo",
+        "mínimo",
+        "intervalo",
+        "periodo",
+        "estabilización",
+        "inicio",
+        "fin",
+    )
+    return any(token in label_norm for token in prioridades)
+
+
+def _legend_color_hex(handle: Any) -> str:
+    color = None
+    if hasattr(handle, "get_color"):
+        color = handle.get_color()
+    if color is None and hasattr(handle, "get_facecolor"):
+        color = handle.get_facecolor()
+        if isinstance(color, np.ndarray) and color.ndim > 1 and len(color):
+            color = color[0]
+    try:
+        return mcolors.to_hex(color)
+    except Exception:
+        return "#666666"
+
+
+def render_external_sensor_legend(fig: plt.Figure, title: str = "Leyenda de sensores") -> None:
+    items = getattr(fig, "_external_sensor_legend_items", None)
+    if not items:
+        return
+    ncol = _legend_columns(len(items))
+    chips = "".join(
+        (
+            '<div style="display:flex;align-items:flex-start;gap:0.45rem;">'
+            f'<span style="display:inline-block;width:0.85rem;height:0.85rem;border-radius:999px;background:{escape(item["color"])};"></span>'
+            f'<span style="line-height:1.25;word-break:break-word;">{escape(item["label"])}</span>'
+            "</div>"
+        )
+        for item in items
+    )
+    st.markdown(
+        (
+            '<div style="margin:-0.15rem 0 0.95rem 0;">'
+            f'<div style="font-size:0.88rem;font-weight:600;margin-bottom:0.35rem;">{escape(title)}</div>'
+            '<div style="border:1px solid rgba(49,51,63,0.18);'
+            'border-radius:0.5rem;padding:0.6rem 0.75rem;background:rgba(250,250,250,0.85);">'
+            f'<div style="display:grid;grid-template-columns:repeat({ncol}, minmax(0, 1fr));gap:0.45rem 1rem;">{chips}</div>'
+            "</div></div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def aplicar_layout_grafico_tiempo(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    ts: pd.Series,
+    *,
+    legend_title: str | None = None,
+) -> None:
+    span = _time_span(ts)
+    fig._external_sensor_legend_items = []
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=MAX_TIME_TICKS)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(matplotlib_compact_date_formatter(ts))
+    rotation = 0 if span >= pd.Timedelta(days=7) else 35
+    ax.tick_params(axis="x", rotation=rotation, labelsize=9)
+    for label in ax.get_xticklabels():
+        label.set_ha("right" if rotation else "center")
+
+    handles, labels = ax.get_legend_handles_labels()
+    handles_unicos: list[Any] = []
+    labels_unicos: list[str] = []
+    vistos: set[str] = set()
+    for handle, label in zip(handles, labels):
+        label_limpio = str(label or "").strip()
+        if not label_limpio or label_limpio.startswith("_") or label_limpio in vistos:
+            continue
+        vistos.add(label_limpio)
+        handles_unicos.append(handle)
+        labels_unicos.append(label_limpio)
+
+    if not handles_unicos:
+        fig.tight_layout()
+        return
+
+    if len(labels_unicos) <= COMPACT_LEGEND_THRESHOLD:
+        ax.legend(
+            handles_unicos,
+            labels_unicos,
+            loc="upper right",
+            title=legend_title,
+            fontsize=9,
+            framealpha=0.9,
+        )
+        fig.tight_layout()
+        return
+
+    fig._external_sensor_legend_items = [
+        {"label": label, "color": _legend_color_hex(handle)}
+        for handle, label in zip(handles_unicos, labels_unicos)
+        if not _is_priority_legend_label(label)
+    ]
+    prioritarios = [
+        (handle, label)
+        for handle, label in zip(handles_unicos, labels_unicos)
+        if _is_priority_legend_label(label)
+    ]
+    if prioritarios and len(prioritarios) <= COMPACT_LEGEND_THRESHOLD:
+        handles_prioritarios, labels_prioritarios = zip(*prioritarios)
+        ax.legend(
+            handles_prioritarios,
+            labels_prioritarios,
+            loc="upper right",
+            title=legend_title,
+            fontsize=9,
+            framealpha=0.9,
+        )
+
+    fig.tight_layout()
+
+
 def titulo_con_contexto(titulo_base: str, contexto: str | None) -> str:
     contexto_limpio = (contexto or "").strip()
     if not contexto_limpio:
@@ -443,6 +617,25 @@ def lineas_umbral_humedad(valor: float | None) -> list[tuple[float, str]]:
     if valor is None or not np.isfinite(valor):
         return []
     return [(float(valor), "Umbral humedad máxima")]
+
+
+def configuraciones_analisis_temperatura(
+    umbrales: list[float],
+    tipo_limite: str | None,
+) -> list[tuple[str, float, str]]:
+    umbrales_validos = sorted(
+        dict.fromkeys(float(valor) for valor in umbrales if valor is not None and np.isfinite(valor))
+    )
+    if len(umbrales_validos) >= 2:
+        umbral_bajo = umbrales_validos[0]
+        umbral_alto = umbrales_validos[-1]
+        return [
+            ("Límite superior", umbral_alto, PruebaTipo.MAX),
+            ("Límite inferior", umbral_bajo, PruebaTipo.MIN),
+        ]
+    if len(umbrales_validos) == 1:
+        return [("Umbral", umbrales_validos[0], tipo_limite or PruebaTipo.MAX)]
+    return []
 
 
 def resaltar_periodo_prueba(
@@ -632,27 +825,30 @@ def _intervalos_fuera(
     if n == 0:
         return []
     if tipo == PruebaTipo.MAX:
-        umbral_cruce = umbral + CROSS_MARGIN
-        fuera = y >= umbral_cruce
+        umbral_salida = umbral + CROSS_MARGIN
+        sale = lambda valor: np.isfinite(valor) and valor >= umbral_salida
+        regresa = lambda valor: np.isfinite(valor) and valor < umbral
     else:
-        umbral_cruce = umbral - CROSS_MARGIN
-        fuera = y <= umbral_cruce
+        umbral_salida = umbral - CROSS_MARGIN
+        sale = lambda valor: np.isfinite(valor) and valor <= umbral_salida
+        regresa = lambda valor: np.isfinite(valor) and valor > umbral
 
     intervalos: list[tuple[pd.Timestamp, pd.Timestamp, float]] = []
     inicio: pd.Timestamp | None = None
 
     for i in range(n - 1):
-        y0, y1 = y[i], y[i + 1]
+        y0, y1 = float(y[i]), float(y[i + 1])
         t0 = pd.Timestamp(t[i])
         t1 = pd.Timestamp(t[i + 1])
 
-        if not fuera[i] and fuera[i + 1]:
-            inicio = t1
+        if inicio is None:
+            if sale(y0):
+                inicio = t0
+            elif sale(y1):
+                inicio = t1
+            continue
 
-        if fuera[i] and inicio is None:
-            inicio = t0
-
-        if fuera[i] and not fuera[i + 1] and inicio is not None:
+        if regresa(y1):
             fin = t1
             dur_h = (fin - inicio).total_seconds() / 3600.0
             if dur_h > 0:
@@ -1399,10 +1595,7 @@ def grafico_tendencias(
     ax.set_title(titulo)
     ax.set_xlabel("Periodo de tiempo")
     ax.set_ylabel(unidad)
-    ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
-    ax.tick_params(axis="x", rotation=90)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    aplicar_layout_grafico_tiempo(fig, ax, ts)
     return fig
 
 
@@ -1448,10 +1641,7 @@ def grafico_destacados(
     ax.set_title(titulo)
     ax.set_xlabel("Periodo de tiempo")
     ax.set_ylabel(unidad)
-    ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
-    ax.tick_params(axis="x", rotation=90)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    aplicar_layout_grafico_tiempo(fig, ax, ts)
     return fig
 
 
@@ -1484,10 +1674,7 @@ def grafico_promedio_intervalos(
     ax.set_title(titulo)
     ax.set_xlabel("Periodo de tiempo")
     ax.set_ylabel(unidad)
-    ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
-    ax.tick_params(axis="x", rotation=90)
-    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", borderaxespad=0.)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    aplicar_layout_grafico_tiempo(fig, ax, ts)
     return fig
 
 
@@ -1679,6 +1866,7 @@ def render_bloque(
             lineas_umbral=lineas_umbral if aplicar_umbrales else None,
         )
         st.pyplot(fig_trend)
+        render_external_sensor_legend(fig_trend)
         plt.close(fig_trend)
 
     mostrar_destacados = st.checkbox(
@@ -2018,7 +2206,7 @@ def plot_prueba_descenso(analisis: AnalisisPrueba, titulo_contexto: str = "") ->
         ax.scatter([analisis.t_baja_primero], [y_near], s=35, zorder=5)
         ax.axvline(analisis.t_baja_primero, linestyle="-.", linewidth=1.1)
         ax.annotate(
-            f"Baja 1º: {analisis.sensor_baja_primero}\n{format_datetime_es(analisis.t_baja_primero, include_seconds=False)}\nΔ={fmt_hm(analisis.retardos_horas.get(analisis.sensor_baja_primero))}",
+            f"Regresa 1º: {analisis.sensor_baja_primero}\n{format_datetime_es(analisis.t_baja_primero, include_seconds=False)}\nΔ={fmt_hm(analisis.retardos_horas.get(analisis.sensor_baja_primero))}",
             xy=(analisis.t_baja_primero, y_near),
             xytext=(15, 15),
             textcoords="offset points",
@@ -2030,7 +2218,7 @@ def plot_prueba_descenso(analisis: AnalisisPrueba, titulo_contexto: str = "") ->
         ax.scatter([analisis.t_baja_ultimo], [y_near], s=35, zorder=5)
         ax.axvline(analisis.t_baja_ultimo, linestyle="-.", linewidth=1.1)
         ax.annotate(
-            f"Baja último: {analisis.sensor_baja_ultimo}\n{format_datetime_es(analisis.t_baja_ultimo, include_seconds=False)}\nΔ={fmt_hm(analisis.retardos_horas.get(analisis.sensor_baja_ultimo))}",
+            f"Regresa último: {analisis.sensor_baja_ultimo}\n{format_datetime_es(analisis.t_baja_ultimo, include_seconds=False)}\nΔ={fmt_hm(analisis.retardos_horas_last.get(analisis.sensor_baja_ultimo))}",
             xy=(analisis.t_baja_ultimo, y_near),
             xytext=(15, -35),
             textcoords="offset points",
@@ -2213,6 +2401,7 @@ def render_prueba_umbrales(
     contexto_general: str = "",
     analisis_por_division: dict[str, AnalisisPrueba] | None = None,
     contextos_division: dict[str, str] | None = None,
+    titulo: str | None = "Análisis de umbral (Prueba)",
 ) -> None:
     bloques: list[tuple[str, str, AnalisisPrueba]] = []
     if analisis_general is not None:
@@ -2231,7 +2420,8 @@ def render_prueba_umbrales(
         st.info("Selecciona un rango válido y configura el umbral para ver el análisis de prueba.")
         return
 
-    st.markdown("### Análisis de umbral (Prueba)")
+    if titulo:
+        st.markdown(f"### {titulo}")
     for idx, (etiqueta, contexto, analisis_actual) in enumerate(bloques):
         if idx > 0:
             st.markdown(f"#### División: {etiqueta}")
@@ -2598,12 +2788,19 @@ def main() -> None:
                     value=80.0,
                     step=1.0,
                 )
-        tipo_limite_label = st.selectbox(
-            "Tipo de límite",
-            ("Mayor que (sobre límite)", "Menor que (bajo límite)"),
-            index=0,
-        )
-        tipo_limite = PruebaTipo.MAX if tipo_limite_label.startswith("Mayor") else PruebaTipo.MIN
+        tipo_limite: str | None = None
+        if habilitar_umbral_temp_extra:
+            st.caption(
+                "Con dos umbrales, el mayor se usa automáticamente como límite superior "
+                "y el menor como límite inferior."
+            )
+        else:
+            tipo_limite_label = st.selectbox(
+                "Tipo de límite",
+                ("Mayor que (sobre límite)", "Menor que (bajo límite)"),
+                index=0,
+            )
+            tipo_limite = PruebaTipo.MAX if tipo_limite_label.startswith("Mayor") else PruebaTipo.MIN
         decimales_report = int(
             st.number_input(
                 "Decimales a mostrar",
@@ -2749,24 +2946,38 @@ def main() -> None:
                     st.pyplot(fig_hum_full)
                     plt.close(fig_hum_full)
 
-            analisis_prueba = None
-            analisis_divisiones: dict[str, AnalisisPrueba] = {}
-            if ti_temp is not None and tf_temp is not None:
-                analisis_prueba = analizar_prueba(df_temp, sel_temp, ti_temp, tf_temp, umbral_temp, tipo_limite)
-                if grupos_temp:
-                    for clave, sensores_grupo in grupos_temp.items():
-                        if not sensores_grupo:
-                            continue
-                        analisis_div = analizar_prueba(df_temp, sensores_grupo, ti_temp, tf_temp, umbral_temp, tipo_limite)
-                        if analisis_div is not None:
-                            analisis_divisiones[clave] = analisis_div
-            render_prueba_umbrales(
-                analisis_prueba,
-                decimales_report,
-                contexto_general,
-                analisis_divisiones if analisis_divisiones else None,
-                contextos_division,
-            )
+            configs_umbral = configuraciones_analisis_temperatura(umbrales_temp_monitoreo, tipo_limite)
+            if len(configs_umbral) > 1:
+                st.markdown("### Análisis de umbrales (Prueba)")
+
+            for etiqueta_umbral, umbral_eval, tipo_eval in configs_umbral:
+                analisis_prueba = None
+                analisis_divisiones: dict[str, AnalisisPrueba] = {}
+                contexto_umbral = (
+                    contexto_general
+                    if len(configs_umbral) == 1
+                    else contexto_con_division(contexto_general, f"{etiqueta_umbral} {fmt_num(umbral_eval, decimales_report)} °C")
+                )
+                if len(configs_umbral) > 1:
+                    st.markdown(f"#### {etiqueta_umbral}: {fmt_num(umbral_eval, decimales_report)} °C")
+
+                if ti_temp is not None and tf_temp is not None:
+                    analisis_prueba = analizar_prueba(df_temp, sel_temp, ti_temp, tf_temp, umbral_eval, tipo_eval)
+                    if grupos_temp:
+                        for clave, sensores_grupo in grupos_temp.items():
+                            if not sensores_grupo:
+                                continue
+                            analisis_div = analizar_prueba(df_temp, sensores_grupo, ti_temp, tf_temp, umbral_eval, tipo_eval)
+                            if analisis_div is not None:
+                                analisis_divisiones[clave] = analisis_div
+                render_prueba_umbrales(
+                    analisis_prueba,
+                    decimales_report,
+                    contexto_umbral,
+                    analisis_divisiones if analisis_divisiones else None,
+                    contextos_division,
+                    titulo=None if len(configs_umbral) > 1 else "Análisis de umbral (Prueba)",
+                )
     gc.collect()
 
 
