@@ -506,23 +506,13 @@ def render_external_sensor_legend(fig: plt.Figure, title: str = "Leyenda de sens
     )
 
 
-def aplicar_layout_grafico_tiempo(
+def aplicar_leyenda_sensores(
     fig: plt.Figure,
     ax: plt.Axes,
-    ts: pd.Series,
     *,
     legend_title: str | None = None,
 ) -> None:
-    span = _time_span(ts)
     fig._external_sensor_legend_items = []
-    locator = mdates.AutoDateLocator(minticks=4, maxticks=MAX_TIME_TICKS)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(matplotlib_compact_date_formatter(ts))
-    rotation = 0 if span >= pd.Timedelta(days=7) else 35
-    ax.tick_params(axis="x", rotation=rotation, labelsize=9)
-    for label in ax.get_xticklabels():
-        label.set_ha("right" if rotation else "center")
-
     handles, labels = ax.get_legend_handles_labels()
     handles_unicos: list[Any] = []
     labels_unicos: list[str] = []
@@ -536,19 +526,6 @@ def aplicar_layout_grafico_tiempo(
         labels_unicos.append(label_limpio)
 
     if not handles_unicos:
-        fig.tight_layout()
-        return
-
-    if len(labels_unicos) <= COMPACT_LEGEND_THRESHOLD:
-        ax.legend(
-            handles_unicos,
-            labels_unicos,
-            loc="upper right",
-            title=legend_title,
-            fontsize=9,
-            framealpha=0.9,
-        )
-        fig.tight_layout()
         return
 
     fig._external_sensor_legend_items = [
@@ -556,6 +533,9 @@ def aplicar_layout_grafico_tiempo(
         for handle, label in zip(handles_unicos, labels_unicos)
         if not _is_priority_legend_label(label)
     ]
+    legend_actual = ax.get_legend()
+    if legend_actual is not None:
+        legend_actual.remove()
     prioritarios = [
         (handle, label)
         for handle, label in zip(handles_unicos, labels_unicos)
@@ -572,7 +552,32 @@ def aplicar_layout_grafico_tiempo(
             framealpha=0.9,
         )
 
+
+def aplicar_layout_grafico_tiempo(
+    fig: plt.Figure,
+    ax: plt.Axes,
+    ts: pd.Series,
+    *,
+    legend_title: str | None = None,
+) -> None:
+    span = _time_span(ts)
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=MAX_TIME_TICKS)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(matplotlib_compact_date_formatter(ts))
+    rotation = 0 if span >= pd.Timedelta(days=7) else 35
+    ax.tick_params(axis="x", rotation=rotation, labelsize=9)
+    for label in ax.get_xticklabels():
+        label.set_ha("right" if rotation else "center")
+
+    aplicar_leyenda_sensores(fig, ax, legend_title=legend_title)
+
     fig.tight_layout()
+
+
+def mostrar_figura(fig: plt.Figure) -> None:
+    st.pyplot(fig)
+    render_external_sensor_legend(fig)
+    plt.close(fig)
 
 
 def titulo_con_contexto(titulo_base: str, contexto: str | None) -> str:
@@ -1848,8 +1853,7 @@ def render_bloque(
     if mostrar_boxplot:
         titulo_box = titulo_con_contexto(f"Distribución de {nombre.lower()} por sensor", titulo_contexto)
         fig_box = grafico_boxplot(df, sensores, titulo_box, unidad, lineas_umbral=None)
-        st.pyplot(fig_box)
-        plt.close(fig_box)
+        mostrar_figura(fig_box)
 
     mostrar_tendencia = st.checkbox(
         "Mostrar tendencia completa",
@@ -1865,9 +1869,7 @@ def render_bloque(
             unidad,
             lineas_umbral=lineas_umbral if aplicar_umbrales else None,
         )
-        st.pyplot(fig_trend)
-        render_external_sensor_legend(fig_trend)
-        plt.close(fig_trend)
+        mostrar_figura(fig_trend)
 
     mostrar_destacados = st.checkbox(
         "Mostrar sensores destacados",
@@ -1892,8 +1894,7 @@ def render_bloque(
                     unidad,
                     lineas_umbral=None,
                 )
-                st.pyplot(fig_dest)
-                plt.close(fig_dest)
+                mostrar_figura(fig_dest)
             if mostrar_promedio:
                 titulo_prom = titulo_con_contexto(f"Promedio general de {nombre.lower()}", titulo_contexto)
                 fig_avg = grafico_promedio_intervalos(
@@ -1903,8 +1904,7 @@ def render_bloque(
                     unidad,
                     lineas_umbral=None,
                 )
-                st.pyplot(fig_avg)
-                plt.close(fig_avg)
+                mostrar_figura(fig_avg)
                 st.caption(
                     " | ".join(
                         [
@@ -2102,6 +2102,7 @@ def plot_prueba_sensor_principal(analisis: AnalisisPrueba, titulo_contexto: str 
         legend_kwargs={"loc": "upper left"},
         anotar=True,
     )
+    aplicar_leyenda_sensores(fig, ax)
     fig.tight_layout()
     return fig
 
@@ -2165,6 +2166,7 @@ def plot_prueba_rango(analisis: AnalisisPrueba, titulo_contexto: str = "") -> pl
             "title": "Orden de cruce",
         },
     )
+    aplicar_leyenda_sensores(fig, ax)
     fig.tight_layout(rect=[0, 0, 0.86, 1])
     return fig
 
@@ -2242,6 +2244,7 @@ def plot_prueba_descenso(analisis: AnalisisPrueba, titulo_contexto: str = "") ->
         color_span="tab:orange",
         legend_kwargs={"bbox_to_anchor": (1.02, 1), "loc": "upper left", "borderaxespad": 0.0},
     )
+    aplicar_leyenda_sensores(fig, ax)
     fig.tight_layout(rect=[0, 0, 0.85, 1])
     return fig
 
@@ -2345,6 +2348,7 @@ def _grafico_prueba_full(
         anotar=True,
     )
     ax.grid(True, axis="x", alpha=0.15)
+    aplicar_leyenda_sensores(fig, ax)
     fig.tight_layout(rect=[0, 0, 0.85, 1])
     return fig
 
@@ -2450,20 +2454,17 @@ def _render_prueba_umbrales_detalle(
 
     fig_first = plot_prueba_sensor_principal(analisis, contexto)
     if fig_first is not None:
-        st.pyplot(fig_first)
-        plt.close(fig_first)
+        mostrar_figura(fig_first)
     else:
         st.info("Ningún sensor cruza el umbral en el periodo seleccionado.")
 
     fig_range = plot_prueba_rango(analisis, contexto)
     if fig_range is not None:
-        st.pyplot(fig_range)
-        plt.close(fig_range)
+        mostrar_figura(fig_range)
 
     fig_descenso = plot_prueba_descenso(analisis, contexto)
     if fig_descenso is not None:
-        st.pyplot(fig_descenso)
-        plt.close(fig_descenso)
+        mostrar_figura(fig_descenso)
 
     filas = []
     data_ctx = analisis.df_contexto.sort_values("Timestamp")
@@ -2928,8 +2929,7 @@ def main() -> None:
                 lineas_umbral=lineas_temp_general,
             )
             if fig_temp_full is not None:
-                st.pyplot(fig_temp_full)
-                plt.close(fig_temp_full)
+                mostrar_figura(fig_temp_full)
 
             st.markdown("### Tendencia de humedad con ventana de prueba")
             if (ti_hum is not None) and (tf_hum is not None) and sel_hum:
@@ -2943,8 +2943,7 @@ def main() -> None:
                     lineas_umbral=lineas_hum_general,
                 )
                 if fig_hum_full is not None:
-                    st.pyplot(fig_hum_full)
-                    plt.close(fig_hum_full)
+                    mostrar_figura(fig_hum_full)
 
             configs_umbral = configuraciones_analisis_temperatura(umbrales_temp_monitoreo, tipo_limite)
             if len(configs_umbral) > 1:
