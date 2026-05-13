@@ -17,7 +17,7 @@ from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib import transforms
-from matplotlib.ticker import FuncFormatter
+from matplotlib.ticker import FixedLocator, FuncFormatter
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -345,9 +345,20 @@ MESES_ES_CORTO = [
 
 MESES_ABREV_A_NUMERO = {mes: idx + 1 for idx, mes in enumerate(MESES_ES_CORTO)}
 FORMATO_FECHA_ES_REGEX = re.compile(
-    r"^\s*(\d{1,2})\s*-\s*([a-záéíóúñ]{3,})\s*-\s*(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\s*$",
+    r"^\s*(\d{1,2})\s*-\s*([a-záéíóúñ]{3,})\s*-\s*(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s*([ap]\.?m\.?))?)?\s*$",
     flags=re.IGNORECASE,
 )
+
+
+def format_time_ampm(dt: pd.Timestamp | datetime | None, include_seconds: bool = True) -> str:
+    if dt is None or pd.isna(dt):
+        return ""
+    ts = pd.to_datetime(dt)
+    hour12 = ts.hour % 12 or 12
+    sufijo = "AM" if ts.hour < 12 else "PM"
+    if include_seconds:
+        return f"{hour12:02d}:{ts.minute:02d}:{ts.second:02d} {sufijo}"
+    return f"{hour12:02d}:{ts.minute:02d} {sufijo}"
 
 
 def _timestamp_es(
@@ -362,8 +373,7 @@ def _timestamp_es(
     fecha = f"{ts.day:02d} - {MESES_ES_CORTO[ts.month - 1]} - {ts.year}"
     if not include_time:
         return fecha
-    formato_hora = "%H:%M:%S" if include_seconds else "%H:%M"
-    return f"{fecha} {ts.strftime(formato_hora)}"
+    return f"{fecha} {format_time_ampm(ts, include_seconds=include_seconds)}"
 
 
 def format_datetime_es(dt: pd.Timestamp | None, include_seconds: bool = True) -> str:
@@ -389,6 +399,17 @@ def parse_datetime_es(texto: str) -> pd.Timestamp | None:
     hora = int(match.group(4)) if match.group(4) is not None else 0
     minuto = int(match.group(5)) if match.group(5) is not None else 0
     segundo = int(match.group(6)) if match.group(6) is not None else 0
+    meridiem = match.group(7)
+    if meridiem is not None:
+        if hora < 1 or hora > 12:
+            return None
+        meridiem = meridiem.lower().replace(".", "")
+        if meridiem.startswith("a"):
+            hora = 0 if hora == 12 else hora
+        else:
+            hora = 12 if hora == 12 else hora + 12
+    elif hora > 23:
+        return None
     try:
         return pd.Timestamp(year=anio, month=mes, day=dia, hour=hora, minute=minuto, second=segundo)
     except ValueError:
@@ -416,11 +437,11 @@ def _timestamp_tick_es(dt: pd.Timestamp | datetime | None, span: pd.Timedelta, i
     if dt is None or pd.isna(dt):
         return ""
     ts = pd.to_datetime(dt)
-    hora_fmt = "%H:%M:%S" if span <= pd.Timedelta(hours=1) else "%H:%M"
+    hora_fmt = format_time_ampm(ts, include_seconds=span <= pd.Timedelta(hours=1))
     if span <= pd.Timedelta(hours=12):
-        return ts.strftime(hora_fmt)
+        return hora_fmt
     if span <= pd.Timedelta(days=3):
-        return f"{ts.day:02d}-{MESES_ES_CORTO[ts.month - 1]} {ts.strftime(hora_fmt)}"
+        return f"{ts.day:02d}-{MESES_ES_CORTO[ts.month - 1]} {hora_fmt}"
     fecha = f"{ts.day:02d}-{MESES_ES_CORTO[ts.month - 1]}"
     return f"{fecha}-{ts.year}" if include_year else fecha
 
@@ -546,7 +567,7 @@ def aplicar_leyenda_sensores(
         ax.legend(
             handles_prioritarios,
             labels_prioritarios,
-            loc="upper right",
+            loc="upper left",
             title=legend_title,
             fontsize=9,
             framealpha=0.9,
@@ -572,6 +593,49 @@ def aplicar_layout_grafico_tiempo(
     aplicar_leyenda_sensores(fig, ax, legend_title=legend_title)
 
     fig.tight_layout()
+
+
+def aplicar_layout_estabilizacion_por_hora(
+    ax: plt.Axes,
+    ts: pd.Series,
+    t_fin: pd.Timestamp | None,
+) -> None:
+    ts_validos = pd.to_datetime(ts, errors="coerce").dropna().sort_values()
+    if ts_validos.empty:
+        return
+
+    t_min = ts_validos.min()
+    t_max = ts_validos.max()
+    rotation = 90
+
+    if t_fin is None or pd.isna(t_fin) or t_fin >= t_max:
+        ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
+    else:
+        locator_previo = mdates.AutoDateLocator(minticks=3, maxticks=max(4, MAX_TIME_TICKS - 2))
+        ticks_previos = locator_previo.tick_values(t_min.to_pydatetime(), t_fin.to_pydatetime())
+
+        hora_inicio_est = pd.Timestamp(t_fin).ceil("h")
+        ticks_estabilizacion: list[float] = []
+        if hora_inicio_est <= t_max:
+            ticks_estabilizacion = mdates.date2num(pd.date_range(hora_inicio_est, t_max, freq="1h").to_pydatetime()).tolist()
+
+        ticks = sorted(set(np.asarray(ticks_previos, dtype=float).tolist() + ticks_estabilizacion))
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+
+        def _formatter(value, _):
+            dt = mdates.num2date(value)
+            if dt.tzinfo is not None:
+                dt = dt.replace(tzinfo=None)
+            ts_tick = pd.Timestamp(dt)
+            if ts_tick >= t_fin:
+                return format_datetime_es(ts_tick, include_seconds=False)
+            return format_datetime_es(ts_tick, include_seconds=False)
+
+        ax.xaxis.set_major_formatter(FuncFormatter(_formatter))
+
+    ax.tick_params(axis="x", rotation=rotation, labelsize=9)
+    for label in ax.get_xticklabels():
+        label.set_ha("right" if rotation else "center")
 
 
 def mostrar_figura(fig: plt.Figure) -> None:
@@ -655,6 +719,7 @@ def resaltar_periodo_prueba(
     alpha_prueba: float = 0.14,
     alpha_estabilizacion: float = 0.05,
     anotar: bool = False,
+    mostrar_flecha_estabilizacion: bool = False,
 ) -> None:
     if t_ini is None or t_fin is None:
         return
@@ -682,7 +747,7 @@ def resaltar_periodo_prueba(
             0.95,
             "Periodo de prueba",
             color=color_span,
-            fontsize=9,
+            fontsize=12,
             fontweight="bold",
             ha="center",
             va="top",
@@ -696,12 +761,27 @@ def resaltar_periodo_prueba(
                 0.95,
                 "Estabilización",
                 color="#4a4a4a",
-                fontsize=9,
+                fontsize=12,
+                fontweight="bold",
                 ha="center",
                 va="top",
                 alpha=0.75,
                 transform=trans,
             )
+            if mostrar_flecha_estabilizacion:
+                span_est = t_max - t_fin
+                x_arrow_ini = t_fin + span_est * 0.04
+                x_arrow_fin = t_max - span_est * 0.04
+                x_arrow_ini_num = mdates.date2num(pd.to_datetime(x_arrow_ini).to_pydatetime())
+                x_arrow_fin_num = mdates.date2num(pd.to_datetime(x_arrow_fin).to_pydatetime())
+                ax.annotate(
+                    "",
+                    xy=(x_arrow_fin_num, 0.42),
+                    xytext=(x_arrow_ini_num, 0.42),
+                    xycoords=trans,
+                    textcoords=trans,
+                    arrowprops=dict(arrowstyle="<->", color="#c00000", lw=2.2, shrinkA=0, shrinkB=0),
+                )
 
     handles, labels = ax.get_legend_handles_labels()
     if handles:
@@ -732,9 +812,13 @@ def filtrar_rango(
             if ts_custom is not None:
                 return ts_custom
             formatos = [
+                "%d-%m-%Y %I:%M:%S %p",
+                "%d-%m-%Y %I:%M %p",
                 "%d-%m-%Y %H:%M:%S",
                 "%d-%m-%Y %H:%M",
                 "%d-%m-%Y",
+                "%d/%m/%Y %I:%M:%S %p",
+                "%d/%m/%Y %I:%M %p",
                 "%d/%m/%Y %H:%M:%S",
                 "%d/%m/%Y %H:%M",
                 "%d/%m/%Y",
@@ -964,8 +1048,6 @@ def construir_eventos_extremos(df: pd.DataFrame, stats: SensorStats) -> pd.DataF
     }
 
     fecha_col = next((c for c in df.columns if str(c).lower().startswith("fecha")), None)
-    hora_col = next((c for c in df.columns if str(c).lower().startswith("hora")), None)
-
     for sensor in stats.stats["Sensor"]:
         serie = to_numeric(df[sensor])
         for tipo, valor in valores.items():
@@ -975,12 +1057,11 @@ def construir_eventos_extremos(df: pd.DataFrame, stats: SensorStats) -> pd.DataF
             for idx in serie[mask].index:
                 ts = df.loc[idx, "Timestamp"]
                 fecha = df.loc[idx, fecha_col] if fecha_col else ts.date()
-                hora = df.loc[idx, hora_col] if hora_col else ts.time().strftime("%H:%M:%S")
                 eventos.append(
                     {
                         "Sensor": sensor,
                         "Fecha": pd.to_datetime(fecha).date() if not pd.isna(fecha) else ts.date(),
-                        "Hora": str(hora),
+                        "Hora": format_time_ampm(ts),
                         "Valor": float(serie.loc[idx]),
                         "Tipo": tipo,
                     }
@@ -1029,8 +1110,8 @@ def _compactar_rango(sensor: str, tipo: str, bloque: pd.DataFrame) -> dict:
         }
     ts_ini = bloque["Timestamp"].iloc[0]
     ts_fin = bloque["Timestamp"].iloc[-1]
-    hora_ini = ts_ini.strftime("%H:%M:%S")
-    hora_fin = ts_fin.strftime("%H:%M:%S")
+    hora_ini = format_time_ampm(ts_ini)
+    hora_fin = format_time_ampm(ts_fin)
     rango = hora_ini if hora_ini == hora_fin else f"{hora_ini}-{hora_fin}"
     return {
         "Sensor": sensor,
@@ -1405,9 +1486,9 @@ def _compactar_eventos_valor(
             filas.append(
                 {
                     "fecha_inicio": format_date_es(ts_ini),
-                    "hora_inicio": ts_ini.strftime("%H:%M:%S"),
+                    "hora_inicio": format_time_ampm(ts_ini),
                     "fecha_fin": format_date_es(ts_fin),
-                    "hora_fin": ts_fin.strftime("%H:%M:%S"),
+                    "hora_fin": format_time_ampm(ts_fin),
                     columna_valor: fmt_num(bloque[columna_valor].iloc[0], decimales),
                     "n_registros": bloque.shape[0],
                     "n_sensores": 1,
@@ -1570,7 +1651,7 @@ def grafico_boxplot(
         if lineas_umbral:
             handles, labels = ax.get_legend_handles_labels()
             if handles:
-                ax.legend(handles, labels, loc="upper right")
+                ax.legend(handles, labels, loc="upper left")
 
     ax.set_title(titulo)
     fig.tight_layout()
@@ -2160,14 +2241,13 @@ def plot_prueba_rango(analisis: AnalisisPrueba, titulo_contexto: str = "") -> pl
         analisis.t_fin_clip,
         color_span="tab:orange",
         legend_kwargs={
-            "bbox_to_anchor": (1.02, 1),
             "loc": "upper left",
-            "borderaxespad": 0.0,
+            "borderaxespad": 0.4,
             "title": "Orden de cruce",
         },
     )
     aplicar_leyenda_sensores(fig, ax)
-    fig.tight_layout(rect=[0, 0, 0.86, 1])
+    fig.tight_layout()
     return fig
 
 
@@ -2242,10 +2322,10 @@ def plot_prueba_descenso(analisis: AnalisisPrueba, titulo_contexto: str = "") ->
         analisis.t_ini_clip,
         analisis.t_fin_clip,
         color_span="tab:orange",
-        legend_kwargs={"bbox_to_anchor": (1.02, 1), "loc": "upper left", "borderaxespad": 0.0},
+        legend_kwargs={"loc": "upper left", "borderaxespad": 0.4},
     )
     aplicar_leyenda_sensores(fig, ax)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    fig.tight_layout()
     return fig
 
 
@@ -2259,6 +2339,7 @@ def _grafico_prueba_full(
     color_span: str,
     decimales: int = DEFAULT_DECIMALES,
     lineas_umbral: list[tuple[float, str]] | None = None,
+    estabilizacion_por_hora: bool = False,
 ) -> plt.Figure | None:
     if df.empty or not sensores or t_ini is None or t_fin is None:
         return None
@@ -2335,21 +2416,25 @@ def _grafico_prueba_full(
     ax.set_title(titulo)
     ax.set_xlabel("Periodo de tiempo")
     ax.set_ylabel(unidad)
-    ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
-    ax.tick_params(axis="x", rotation=90)
     ax.set_xlim(ts.min(), ts.max())
+    if estabilizacion_por_hora:
+        aplicar_layout_estabilizacion_por_hora(ax, ts, t_fin)
+    else:
+        ax.xaxis.set_major_formatter(matplotlib_date_formatter(include_seconds=False))
+        ax.tick_params(axis="x", rotation=90)
     resaltar_periodo_prueba(
         ax,
         ts,
         t_ini,
         t_fin,
         color_span=color_span,
-        legend_kwargs={"bbox_to_anchor": (1.02, 1), "loc": "upper left", "borderaxespad": 0.},
+        legend_kwargs={"loc": "upper left", "borderaxespad": 0.4},
         anotar=True,
+        mostrar_flecha_estabilizacion=unidad == "°C",
     )
     ax.grid(True, axis="x", alpha=0.15)
     aplicar_leyenda_sensores(fig, ax)
-    fig.tight_layout(rect=[0, 0, 0.85, 1])
+    fig.tight_layout()
     return fig
 
 
@@ -2373,6 +2458,7 @@ def grafico_temp_prueba_full(
         color_span="tab:orange",
         decimales=decimales,
         lineas_umbral=lineas_umbral,
+        estabilizacion_por_hora=True,
     )
 
 
@@ -2758,11 +2844,11 @@ def main() -> None:
             max_ts = max(valid_max)
             default_ini = format_datetime_es(min_ts, include_seconds=False)
             default_fin = format_datetime_es(max_ts, include_seconds=False)
-            fecha_ini = st.text_input("Fecha inicio (DD - mes - YYYY HH:MM)", value=default_ini)
-            fecha_fin = st.text_input("Fecha fin (DD - mes - YYYY HH:MM)", value=default_fin)
+            fecha_ini = st.text_input("Fecha inicio (DD - mes - YYYY hh:mm AM/PM)", value=default_ini)
+            fecha_fin = st.text_input("Fecha fin (DD - mes - YYYY hh:mm AM/PM)", value=default_fin)
         else:
-            fecha_ini = st.text_input("Fecha inicio (DD - mes - YYYY HH:MM)")
-            fecha_fin = st.text_input("Fecha fin (DD - mes - YYYY HH:MM)")
+            fecha_ini = st.text_input("Fecha inicio (DD - mes - YYYY hh:mm AM/PM)")
+            fecha_fin = st.text_input("Fecha fin (DD - mes - YYYY hh:mm AM/PM)")
         intervalo_minutos = st.number_input(
             "Intervalo para rachas (min)",
             min_value=1,
