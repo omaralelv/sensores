@@ -5,14 +5,16 @@ from __future__ import annotations
 import io
 import os
 import re
-from dataclasses import dataclass
-from datetime import datetime
+import textwrap
+from dataclasses import dataclass, field
+from datetime import date, datetime, time as dt_time
 from html import escape
 from typing import Any, Iterable
 from pathlib import Path
 import gc
 
 import matplotlib.dates as mdates
+from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
@@ -45,6 +47,8 @@ CROSS_MARGIN = 0.001  # margen adicional para considerar un cruce fuera del umbr
 DEFAULT_FIGSIZE = (16, 6.5)
 MAX_TIME_TICKS = 8
 COMPACT_LEGEND_THRESHOLD = 8
+PDF_TEXT_WIDTH = 112
+PDF_LINES_PER_PAGE = 52
 
 
 class PruebaTipo:
@@ -57,6 +61,38 @@ NOMBRES_GRUPOS = {
     "stage": "Stage",
     "maquila": "Maquila",
 }
+
+
+@dataclass
+class ReportItem:
+    kind: str
+    title: str
+    text: str = ""
+    fig: plt.Figure | None = None
+    filename: str = ""
+
+
+@dataclass
+class ReporteVista:
+    titulo: str
+    items: list[ReportItem] = field(default_factory=list)
+    figuras: list[ReportItem] = field(default_factory=list)
+
+    def add_heading(self, titulo: str) -> None:
+        titulo_limpio = str(titulo or "").strip()
+        if titulo_limpio:
+            self.items.append(ReportItem("heading", titulo_limpio))
+
+    def add_text(self, titulo: str, texto: str) -> None:
+        texto_limpio = str(texto or "").rstrip()
+        if texto_limpio:
+            self.items.append(ReportItem("text", str(titulo or "").strip(), texto_limpio))
+
+    def add_figure(self, titulo: str, fig: plt.Figure, filename: str) -> int:
+        item = ReportItem("figure", str(titulo or "Gráfica").strip(), fig=fig, filename=filename)
+        self.items.append(item)
+        self.figuras.append(item)
+        return len(self.figuras)
 
 
 # -----------------------------------------------------------------------------
@@ -156,10 +192,63 @@ def list_sheets(file_bytes: bytes) -> list[str]:
     return list(xls.sheet_names)
 
 
+def _coerce_datetime_value(value: Any) -> pd.Timestamp | pd.NaT:
+    if value is None or pd.isna(value):
+        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        return value
+    if isinstance(value, (datetime, date, np.datetime64)):
+        return pd.to_datetime(value, errors="coerce")
+    texto = str(value).strip()
+    if not texto or texto.lower() == "nat":
+        return pd.NaT
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}(?:\s|$)", texto):
+        return pd.to_datetime(texto, errors="coerce")
+    return pd.to_datetime(texto, errors="coerce", dayfirst=True)
+
+
+def _coerce_datetime_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_datetime(series, errors="coerce", unit="D", origin="1899-12-30")
+    return series.apply(_coerce_datetime_value)
+
+
+def _coerce_time_to_timedelta(series: pd.Series) -> pd.Series:
+    def _convert(value: Any) -> pd.Timedelta | pd.NaT:
+        if value is None or pd.isna(value):
+            return pd.NaT
+        if isinstance(value, pd.Timedelta):
+            return value
+        if isinstance(value, dt_time):
+            return pd.Timedelta(hours=value.hour, minutes=value.minute, seconds=value.second)
+        if isinstance(value, (pd.Timestamp, datetime)):
+            return pd.Timedelta(hours=value.hour, minutes=value.minute, seconds=value.second)
+        texto = str(value).strip()
+        if not texto or texto.lower() == "nat":
+            return pd.NaT
+        td = pd.to_timedelta(texto, errors="coerce")
+        if pd.notna(td):
+            return td
+        for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+            try:
+                parsed = datetime.strptime(texto, fmt)
+                return pd.Timedelta(hours=parsed.hour, minutes=parsed.minute, seconds=parsed.second)
+            except ValueError:
+                continue
+        parsed = pd.to_datetime(texto, errors="coerce")
+        if pd.notna(parsed):
+            return pd.Timedelta(hours=parsed.hour, minutes=parsed.minute, seconds=parsed.second)
+        return pd.NaT
+
+    return series.apply(_convert)
+
+
 def parse_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
     if "Timestamp" in data.columns:
-        data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+        data["Timestamp"] = _coerce_datetime_series(data["Timestamp"])
         return data
 
     fecha_col = next((c for c in data.columns if str(c).lower().startswith("fecha")), None)
@@ -167,12 +256,12 @@ def parse_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     if fecha_col is None:
         raise ValueError("La hoja no contiene columnas de fecha/Timestamp")
 
-    fecha_texto = data[fecha_col].astype(str).str.strip()
+    fecha_base = _coerce_datetime_series(data[fecha_col])
     if hora_col is not None:
-        hora_texto = data[hora_col].astype(str).str.strip()
-        timestamp = pd.to_datetime(fecha_texto + " " + hora_texto, errors="coerce", dayfirst=True)
+        hora_delta = _coerce_time_to_timedelta(data[hora_col])
+        timestamp = fecha_base.dt.normalize() + hora_delta
     else:
-        timestamp = pd.to_datetime(fecha_texto, errors="coerce", dayfirst=True)
+        timestamp = fecha_base
 
     data["Timestamp"] = timestamp
     return data
@@ -638,9 +727,136 @@ def aplicar_layout_estabilizacion_por_hora(
         label.set_ha("right" if rotation else "center")
 
 
-def mostrar_figura(fig: plt.Figure) -> None:
+def _slug_filename(texto: str, default: str = "reporte") -> str:
+    base = re.sub(r"\W+", "_", str(texto or "").strip().lower()).strip("_")
+    return base or default
+
+
+def _legend_text_for_pdf(fig: plt.Figure) -> str:
+    items = getattr(fig, "_external_sensor_legend_items", None) or []
+    if not items:
+        return ""
+    lineas = ["Leyenda de sensores"]
+    for item in items:
+        label = str(item.get("label", "")).strip()
+        color = str(item.get("color", "")).strip()
+        if label:
+            lineas.append(f"- {label} ({color})" if color else f"- {label}")
+    return "\n".join(lineas)
+
+
+def _wrap_pdf_lines(texto: str, width: int = PDF_TEXT_WIDTH) -> list[str]:
+    lineas: list[str] = []
+    for raw_line in str(texto or "").splitlines():
+        if not raw_line:
+            lineas.append("")
+            continue
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=width,
+            replace_whitespace=False,
+            drop_whitespace=False,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        lineas.extend(wrapped or [""])
+    return lineas or [""]
+
+
+def _add_text_pages_to_pdf(pdf: PdfPages, titulo: str, texto: str) -> None:
+    lineas = _wrap_pdf_lines(texto)
+    total_pages = max(1, int(np.ceil(len(lineas) / PDF_LINES_PER_PAGE)))
+    for idx in range(total_pages):
+        inicio = idx * PDF_LINES_PER_PAGE
+        fin = inicio + PDF_LINES_PER_PAGE
+        pagina_lineas = lineas[inicio:fin]
+        fig = plt.figure(figsize=(8.5, 11))
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        titulo_pagina = titulo or "Reporte"
+        if total_pages > 1:
+            titulo_pagina = f"{titulo_pagina} ({idx + 1}/{total_pages})"
+        ax.text(0.055, 0.965, titulo_pagina, fontsize=13, fontweight="bold", va="top")
+        ax.text(
+            0.055,
+            0.925,
+            "\n".join(pagina_lineas),
+            fontsize=7.8,
+            family="DejaVu Sans Mono",
+            va="top",
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+
+def _add_heading_page_to_pdf(pdf: PdfPages, titulo: str) -> None:
+    fig = plt.figure(figsize=(8.5, 11))
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.axis("off")
+    ax.text(0.08, 0.55, titulo, fontsize=22, fontweight="bold", va="center")
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def crear_pdf_figura(fig: plt.Figure, titulo: str) -> bytes:
+    buffer = io.BytesIO()
+    with PdfPages(buffer) as pdf:
+        pdf.savefig(fig, bbox_inches="tight")
+        leyenda = _legend_text_for_pdf(fig)
+        if leyenda:
+            _add_text_pages_to_pdf(pdf, f"Leyenda - {titulo}", leyenda)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def crear_pdf_reporte(reporte: ReporteVista) -> bytes:
+    buffer = io.BytesIO()
+    generado = datetime.now().strftime("%d/%m/%Y %I:%M %p")
+    with PdfPages(buffer) as pdf:
+        _add_text_pages_to_pdf(pdf, reporte.titulo, f"Generado: {generado}")
+        for item in reporte.items:
+            if item.kind == "heading":
+                _add_heading_page_to_pdf(pdf, item.title)
+            elif item.kind == "text":
+                _add_text_pages_to_pdf(pdf, item.title or reporte.titulo, item.text)
+            elif item.kind == "figure" and item.fig is not None:
+                pdf.savefig(item.fig, bbox_inches="tight")
+                leyenda = _legend_text_for_pdf(item.fig)
+                if leyenda:
+                    _add_text_pages_to_pdf(pdf, f"Leyenda - {item.title}", leyenda)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def render_descarga_reporte(reporte: ReporteVista, key: str, filename_base: str) -> None:
+    st.download_button(
+        "Descargar vista completa (PDF)",
+        data=crear_pdf_reporte(reporte),
+        file_name=f"{_slug_filename(filename_base)}.pdf",
+        mime="application/pdf",
+        key=key,
+    )
+
+
+def mostrar_figura(
+    fig: plt.Figure,
+    reporte: ReporteVista | None = None,
+    titulo: str | None = None,
+    key_suffix: str | None = None,
+) -> None:
+    titulo_fig = titulo or "Gráfica"
+    filename = f"{_slug_filename(titulo_fig, 'grafica')}.pdf"
+    figura_idx = reporte.add_figure(titulo_fig, fig, filename) if reporte is not None else 0
     st.pyplot(fig)
     render_external_sensor_legend(fig)
+    key_ctx = key_suffix or f"{titulo_fig}_{figura_idx or id(fig)}"
+    st.download_button(
+        "Descargar gráfica (PDF)",
+        data=crear_pdf_figura(fig, titulo_fig),
+        file_name=filename,
+        mime="application/pdf",
+        key=_widget_key("descarga_grafica", titulo_fig, key_ctx),
+    )
     plt.close(fig)
 
 
@@ -1057,10 +1273,11 @@ def construir_eventos_extremos(df: pd.DataFrame, stats: SensorStats) -> pd.DataF
             for idx in serie[mask].index:
                 ts = df.loc[idx, "Timestamp"]
                 fecha = df.loc[idx, fecha_col] if fecha_col else ts.date()
+                fecha_parseada = _coerce_datetime_value(fecha)
                 eventos.append(
                     {
                         "Sensor": sensor,
-                        "Fecha": pd.to_datetime(fecha).date() if not pd.isna(fecha) else ts.date(),
+                        "Fecha": fecha_parseada.date() if pd.notna(fecha_parseada) else ts.date(),
                         "Hora": format_time_ampm(ts),
                         "Valor": float(serie.loc[idx]),
                         "Tipo": tipo,
@@ -1078,8 +1295,10 @@ def agrupar_eventos(eventos: pd.DataFrame, intervalo_minutos: int) -> pd.DataFra
         return pd.DataFrame(columns=["Sensor", "Fecha", "Hora (Rango)", "Valor Registrado", "Frecuencia", "Tipo"])
 
     tmp = eventos.copy()
-    tmp["Fecha"] = pd.to_datetime(tmp["Fecha"], errors="coerce").dt.date
-    tmp["Timestamp"] = pd.to_datetime(tmp["Fecha"].astype(str) + " " + tmp["Hora"], errors="coerce")
+    fecha_base = _coerce_datetime_series(tmp["Fecha"])
+    hora_delta = _coerce_time_to_timedelta(tmp["Hora"])
+    tmp["Fecha"] = fecha_base.dt.date
+    tmp["Timestamp"] = fecha_base.dt.normalize() + hora_delta
     tmp = tmp.dropna(subset=["Timestamp"]).sort_values(["Sensor", "Tipo", "Timestamp"])
 
     registros: list[dict] = []
@@ -1889,10 +2108,16 @@ def render_bloque(
     lineas_umbral: list[tuple[float, str]] | None = None,
     aplicar_umbrales: bool = True,
     key_suffix: str | None = None,
+    reporte: ReporteVista | None = None,
 ) -> None:
     if df.empty or not sensores:
         st.info(f"Sin datos de {nombre.lower()} para mostrar.")
+        if reporte is not None:
+            reporte.add_text(nombre, f"Sin datos de {nombre.lower()} para mostrar.")
         return
+
+    if reporte is not None:
+        reporte.add_heading(nombre)
 
     stats = calcular_estadisticas(df, sensores)
     es_temperatura = nombre.lower().startswith("temperatura")
@@ -1907,6 +2132,8 @@ def render_bloque(
     )
 
     st.text(resumen_texto)
+    if reporte is not None:
+        reporte.add_text(f"Resumen - {nombre}", resumen_texto)
 
     titulo_max = f"Tabla Repetición Máxima ({nombre} compactada)"
     titulo_min = f"Tabla Repetición Mínima ({nombre} compactada)"
@@ -1920,8 +2147,13 @@ def render_bloque(
         "n_sensores",
         "sensores",
     ]
-    st.text(_tabla_texto(titulo_max, tabla_max, columnas))
-    st.text(_tabla_texto(titulo_min, tabla_min, columnas))
+    texto_tabla_max = _tabla_texto(titulo_max, tabla_max, columnas)
+    texto_tabla_min = _tabla_texto(titulo_min, tabla_min, columnas)
+    st.text(texto_tabla_max)
+    st.text(texto_tabla_min)
+    if reporte is not None:
+        reporte.add_text(titulo_max, texto_tabla_max)
+        reporte.add_text(titulo_min, texto_tabla_min)
 
     key_base = key_suffix or f"{nombre}_{titulo_contexto or 'general'}"
     st.caption("Activa los gráficos que necesites; se generan al momento y consumen memoria adicional.")
@@ -1934,7 +2166,7 @@ def render_bloque(
     if mostrar_boxplot:
         titulo_box = titulo_con_contexto(f"Distribución de {nombre.lower()} por sensor", titulo_contexto)
         fig_box = grafico_boxplot(df, sensores, titulo_box, unidad, lineas_umbral=None)
-        mostrar_figura(fig_box)
+        mostrar_figura(fig_box, reporte, titulo_box, key_suffix=f"{key_base}_boxplot")
 
     mostrar_tendencia = st.checkbox(
         "Mostrar tendencia completa",
@@ -1950,7 +2182,7 @@ def render_bloque(
             unidad,
             lineas_umbral=lineas_umbral if aplicar_umbrales else None,
         )
-        mostrar_figura(fig_trend)
+        mostrar_figura(fig_trend, reporte, titulo_tend, key_suffix=f"{key_base}_tendencia")
 
     mostrar_destacados = st.checkbox(
         "Mostrar sensores destacados",
@@ -1975,7 +2207,7 @@ def render_bloque(
                     unidad,
                     lineas_umbral=None,
                 )
-                mostrar_figura(fig_dest)
+                mostrar_figura(fig_dest, reporte, titulo_dest, key_suffix=f"{key_base}_destacados")
             if mostrar_promedio:
                 titulo_prom = titulo_con_contexto(f"Promedio general de {nombre.lower()}", titulo_contexto)
                 fig_avg = grafico_promedio_intervalos(
@@ -1985,17 +2217,18 @@ def render_bloque(
                     unidad,
                     lineas_umbral=None,
                 )
-                mostrar_figura(fig_avg)
-                st.caption(
-                    " | ".join(
-                        [
-                            f"Percentil 99: {fmt_num(analisis.p99, decimales)}{unidad}",
-                            f"Percentil 1: {fmt_num(analisis.p01, decimales)}{unidad}",
-                            f"Máximo global: {fmt_num(analisis.max_val, decimales)}{unidad}",
-                            f"Mínimo global: {fmt_num(analisis.min_val, decimales)}{unidad}",
-                        ]
-                    )
+                mostrar_figura(fig_avg, reporte, titulo_prom, key_suffix=f"{key_base}_promedio")
+                texto_caption = " | ".join(
+                    [
+                        f"Percentil 99: {fmt_num(analisis.p99, decimales)}{unidad}",
+                        f"Percentil 1: {fmt_num(analisis.p01, decimales)}{unidad}",
+                        f"Máximo global: {fmt_num(analisis.max_val, decimales)}{unidad}",
+                        f"Mínimo global: {fmt_num(analisis.min_val, decimales)}{unidad}",
+                    ]
                 )
+                st.caption(texto_caption)
+                if reporte is not None:
+                    reporte.add_text(f"Indicadores - {nombre}", texto_caption)
 
 
 def render_seccion(
@@ -2017,52 +2250,68 @@ def render_seccion(
     umbral_hum_max: float | None = None,
     grupos_temp: dict[str, list[str]] | None = None,
     grupos_hum: dict[str, list[str]] | None = None,
+    mostrar_temperatura: bool = True,
     mostrar_humedad: bool = True,
+    reporte: ReporteVista | None = None,
 ) -> None:
     st.header(titulo)
+    if reporte is not None:
+        reporte.add_heading(titulo)
 
-    st.markdown("### Temperatura")
-    if periodo_temp[0] is not None and periodo_temp[1] is not None:
-        st.caption(f"Periodo: {format_datetime_es(periodo_temp[0])} → {format_datetime_es(periodo_temp[1])}")
     contexto_general = contexto_con_division(titulo_contexto, "General")
-    lineas_temp = lineas_umbral_temperatura(umbrales_temp or [])
-    render_bloque(
-        "Temperatura",
-        df_temp,
-        sensores_temp,
-        unidad_temp,
-        intervalo_minutos,
-        decimales,
-        contexto_general,
-        lineas_temp,
-        aplicar_umbrales=True,
-        key_suffix=f"{titulo}_temp_general",
-    )
 
-    if grupos_temp:
-        st.markdown("#### Temperatura por área")
-        tabs_temp = st.tabs([NOMBRES_GRUPOS.get(g, g.title()) for g in grupos_temp])
-        for tab, (grupo_nombre, sensores_grupo) in zip(tabs_temp, grupos_temp.items()):
-            with tab:
-                division_label = NOMBRES_GRUPOS.get(grupo_nombre, grupo_nombre.title())
-                contexto_grupo = contexto_con_division(titulo_contexto, division_label)
-                render_bloque(
-                    f"Temperatura ({division_label})",
-                    df_temp,
-                    sensores_grupo,
-                    unidad_temp,
-                    intervalo_minutos,
-                    decimales,
-                    contexto_grupo,
-                    lineas_temp,
-                    aplicar_umbrales=False,
-                    key_suffix=f"{titulo}_temp_{grupo_nombre}",
-                )
+    if mostrar_temperatura:
+        st.markdown("### Temperatura")
+        if periodo_temp[0] is not None and periodo_temp[1] is not None:
+            texto_periodo = f"Periodo: {format_datetime_es(periodo_temp[0])} → {format_datetime_es(periodo_temp[1])}"
+            st.caption(texto_periodo)
+            if reporte is not None:
+                reporte.add_text("Periodo - Temperatura", texto_periodo)
+        lineas_temp = lineas_umbral_temperatura(umbrales_temp or [])
+        render_bloque(
+            "Temperatura",
+            df_temp,
+            sensores_temp,
+            unidad_temp,
+            intervalo_minutos,
+            decimales,
+            contexto_general,
+            lineas_temp,
+            aplicar_umbrales=True,
+            key_suffix=f"{titulo}_temp_general",
+            reporte=reporte,
+        )
+
+        if grupos_temp:
+            st.markdown("#### Temperatura por área")
+            if reporte is not None:
+                reporte.add_heading("Temperatura por área")
+            tabs_temp = st.tabs([NOMBRES_GRUPOS.get(g, g.title()) for g in grupos_temp])
+            for tab, (grupo_nombre, sensores_grupo) in zip(tabs_temp, grupos_temp.items()):
+                with tab:
+                    division_label = NOMBRES_GRUPOS.get(grupo_nombre, grupo_nombre.title())
+                    contexto_grupo = contexto_con_division(titulo_contexto, division_label)
+                    render_bloque(
+                        f"Temperatura ({division_label})",
+                        df_temp,
+                        sensores_grupo,
+                        unidad_temp,
+                        intervalo_minutos,
+                        decimales,
+                        contexto_grupo,
+                        lineas_temp,
+                        aplicar_umbrales=False,
+                        key_suffix=f"{titulo}_temp_{grupo_nombre}",
+                        reporte=reporte,
+                    )
 
     if mostrar_humedad and sensores_hum:
         st.markdown("### Humedad")
         if periodo_hum[0] is not None and periodo_hum[1] is not None:
-            st.caption(f"Periodo: {format_datetime_es(periodo_hum[0])} → {format_datetime_es(periodo_hum[1])}")
+            texto_periodo = f"Periodo: {format_datetime_es(periodo_hum[0])} → {format_datetime_es(periodo_hum[1])}"
+            st.caption(texto_periodo)
+            if reporte is not None:
+                reporte.add_text("Periodo - Humedad", texto_periodo)
         lineas_hum = lineas_umbral_humedad(umbral_hum_max)
         render_bloque(
             "Humedad",
@@ -2075,10 +2324,13 @@ def render_seccion(
             lineas_hum,
             aplicar_umbrales=bool(lineas_hum),
             key_suffix=f"{titulo}_hum_general",
+            reporte=reporte,
         )
 
         if grupos_hum:
             st.markdown("#### Humedad por área")
+            if reporte is not None:
+                reporte.add_heading("Humedad por área")
             tabs_hum = st.tabs([NOMBRES_GRUPOS.get(g, g.title()) for g in grupos_hum])
             for tab, (grupo_nombre, sensores_grupo) in zip(tabs_hum, grupos_hum.items()):
                 with tab:
@@ -2095,6 +2347,7 @@ def render_seccion(
                         lineas_hum,
                         aplicar_umbrales=False,
                         key_suffix=f"{titulo}_hum_{grupo_nombre}",
+                        reporte=reporte,
                     )
 
     bloques_mapeo = construir_bloques_mapeo(
@@ -2109,6 +2362,8 @@ def render_seccion(
     if bloques_mapeo:
         st.markdown("### Mapeo de sensores y puntos críticos")
         st.text(bloques_mapeo)
+        if reporte is not None:
+            reporte.add_text("Mapeo de sensores y puntos críticos", bloques_mapeo)
 
 
 def plot_prueba_sensor_principal(analisis: AnalisisPrueba, titulo_contexto: str = "") -> plt.Figure | None:
@@ -2492,6 +2747,7 @@ def render_prueba_umbrales(
     analisis_por_division: dict[str, AnalisisPrueba] | None = None,
     contextos_division: dict[str, str] | None = None,
     titulo: str | None = "Análisis de umbral (Prueba)",
+    reporte: ReporteVista | None = None,
 ) -> None:
     bloques: list[tuple[str, str, AnalisisPrueba]] = []
     if analisis_general is not None:
@@ -2508,14 +2764,20 @@ def render_prueba_umbrales(
 
     if not bloques:
         st.info("Selecciona un rango válido y configura el umbral para ver el análisis de prueba.")
+        if reporte is not None:
+            reporte.add_text("Análisis de umbral (Prueba)", "Selecciona un rango válido y configura el umbral para ver el análisis de prueba.")
         return
 
     if titulo:
         st.markdown(f"### {titulo}")
+        if reporte is not None:
+            reporte.add_heading(titulo)
     for idx, (etiqueta, contexto, analisis_actual) in enumerate(bloques):
         if idx > 0:
             st.markdown(f"#### División: {etiqueta}")
-        _render_prueba_umbrales_detalle(analisis_actual, decimales, contexto, etiqueta)
+            if reporte is not None:
+                reporte.add_heading(f"División: {etiqueta}")
+        _render_prueba_umbrales_detalle(analisis_actual, decimales, contexto, etiqueta, reporte)
 
 
 def _render_prueba_umbrales_detalle(
@@ -2523,34 +2785,42 @@ def _render_prueba_umbrales_detalle(
     decimales: int,
     contexto: str,
     division_label: str,
+    reporte: ReporteVista | None = None,
 ) -> None:
     fmt = lambda valor: fmt_num(valor, decimales)
     umbral_cruce = analisis.umbral + CROSS_MARGIN if analisis.tipo == PruebaTipo.MAX else analisis.umbral - CROSS_MARGIN
 
     st.markdown(f"**División analizada:** {division_label}")
-    st.caption(
-        " | ".join(
-            [
-                f"Umbral = {fmt(analisis.umbral)} °C (cruce desde {fmt(umbral_cruce)} °C)",
-                "Condición: mayor que" if analisis.tipo == PruebaTipo.MAX else "Condición: menor que",
-                f"Periodo: {format_datetime_es(analisis.t_ini_clip, include_seconds=False)} → {format_datetime_es(analisis.t_fin_clip, include_seconds=False)}",
-            ]
-        )
+    texto_contexto = " | ".join(
+        [
+            f"División analizada: {division_label}",
+            f"Umbral = {fmt(analisis.umbral)} °C (cruce desde {fmt(umbral_cruce)} °C)",
+            "Condición: mayor que" if analisis.tipo == PruebaTipo.MAX else "Condición: menor que",
+            f"Periodo: {format_datetime_es(analisis.t_ini_clip, include_seconds=False)} → {format_datetime_es(analisis.t_fin_clip, include_seconds=False)}",
+        ]
     )
+    st.caption(texto_contexto)
+    if reporte is not None:
+        reporte.add_text(f"Contexto umbral - {division_label}", texto_contexto)
 
     fig_first = plot_prueba_sensor_principal(analisis, contexto)
     if fig_first is not None:
-        mostrar_figura(fig_first)
+        titulo_fig = titulo_con_contexto("Sensor principal de prueba", contexto)
+        mostrar_figura(fig_first, reporte, titulo_fig, key_suffix=f"{contexto}_{division_label}_sensor_principal")
     else:
         st.info("Ningún sensor cruza el umbral en el periodo seleccionado.")
+        if reporte is not None:
+            reporte.add_text(f"Resultado umbral - {division_label}", "Ningún sensor cruza el umbral en el periodo seleccionado.")
 
     fig_range = plot_prueba_rango(analisis, contexto)
     if fig_range is not None:
-        mostrar_figura(fig_range)
+        titulo_fig = titulo_con_contexto("Rango de prueba", contexto)
+        mostrar_figura(fig_range, reporte, titulo_fig, key_suffix=f"{contexto}_{division_label}_rango")
 
     fig_descenso = plot_prueba_descenso(analisis, contexto)
     if fig_descenso is not None:
-        mostrar_figura(fig_descenso)
+        titulo_fig = titulo_con_contexto("Regreso al umbral", contexto)
+        mostrar_figura(fig_descenso, reporte, titulo_fig, key_suffix=f"{contexto}_{division_label}_regreso")
 
     filas = []
     data_ctx = analisis.df_contexto.sort_values("Timestamp")
@@ -2601,6 +2871,8 @@ def _render_prueba_umbrales_detalle(
             ),
         ]
         st.text("\n".join(resumen_fuera))
+        if reporte is not None:
+            reporte.add_text(f"Tiempo fuera del límite - {division_label}", "\n".join(resumen_fuera))
 
     if analisis.cruces_down_after:
         data_ctx = analisis.df_contexto.sort_values("Timestamp")
@@ -2648,20 +2920,26 @@ def _render_prueba_umbrales_detalle(
                 ),
             ]
             st.text("\n".join(resumen))
+            if reporte is not None:
+                reporte.add_text(f"Orden de regreso - {division_label}", "\n".join(resumen))
         else:
-            st.text(
+            texto_sin_reingresos = (
                 "Umbral: "
                 f"{fmt(analisis.umbral)} °C | Inicio {format_datetime_es(analisis.t_ini_clip, include_seconds=False)}\n"
                 "Periodo de prueba sin reingresos registrados."
             )
+            st.text(texto_sin_reingresos)
+            if reporte is not None:
+                reporte.add_text(f"Reingresos - {division_label}", texto_sin_reingresos)
 
 # -----------------------------------------------------------------------------
 # UI principal
 # -----------------------------------------------------------------------------
 def main() -> None:
     st.title("📈 Reportes de sensores (Monitoreo / Prueba)")
-    st.write("Carga un archivo Excel con hojas de temperatura y humedad para obtener el mismo análisis del notebook.")
+    st.write("Carga un archivo Excel con hojas de temperatura y/o humedad para obtener el mismo análisis del notebook.")
 
+    incluir_temperatura = True
     incluir_humedad = True
     contexto_general = ""
     contextos_division: dict[str, str] = {}
@@ -2686,14 +2964,28 @@ def main() -> None:
                 if keyword in sheet.lower():
                     return i
             return 0
-        incluir_humedad = st.checkbox("Incluir análisis de humedad", value=True, key="toggle_incluir_humedad")
-        sheet_temp = st.selectbox("Hoja de temperatura", sheets, index=default_index(DEFAULT_TEMP_SHEET_HINT))
+
+        tipo_analisis = st.radio(
+            "Tipo de análisis",
+            ("Ambas", "Temperatura", "Humedad"),
+            index=0,
+            key="tipo_analisis",
+        )
+        incluir_temperatura = tipo_analisis in ("Ambas", "Temperatura")
+        incluir_humedad = tipo_analisis in ("Ambas", "Humedad")
+
+        sheet_temp = None
+        if incluir_temperatura:
+            sheet_temp = st.selectbox("Hoja de temperatura", sheets, index=default_index(DEFAULT_TEMP_SHEET_HINT))
         sheet_hum = None
         if incluir_humedad:
             sheet_hum = st.selectbox("Hoja de humedad", sheets, index=default_index(DEFAULT_HUM_SHEET_HINT))
 
     try:
-        df_temp = cargar_dataframe_cache(file_bytes, sheet_temp)
+        if incluir_temperatura and sheet_temp is not None:
+            df_temp = cargar_dataframe_cache(file_bytes, sheet_temp)
+        else:
+            df_temp = pd.DataFrame(columns=["Timestamp"])
         if incluir_humedad and sheet_hum is not None:
             df_hum = cargar_dataframe_cache(file_bytes, sheet_hum)
         else:
@@ -2703,18 +2995,28 @@ def main() -> None:
         safe_stop()
         return
 
-    sensores_temp = detectar_sensores(df_temp, {"Timestamp", "Fecha", "Hora"})
+    sensores_temp = detectar_sensores(df_temp, {"Timestamp", "Fecha", "Hora"}) if incluir_temperatura else []
     sensores_hum = detectar_sensores(df_hum, {"Timestamp", "Fecha", "Hora"}) if incluir_humedad else []
 
-    if not sensores_temp:
-        st.error("No se detectaron columnas de sensores de temperatura.")
-        safe_stop()
-        return
+    if incluir_temperatura and not sensores_temp:
+        if incluir_humedad and sensores_hum:
+            st.warning("No se detectaron sensores de temperatura. El análisis continuará solo con humedad.")
+            incluir_temperatura = False
+            df_temp = pd.DataFrame(columns=["Timestamp"])
+        else:
+            st.error("No se detectaron columnas de sensores de temperatura.")
+            safe_stop()
+            return
     if incluir_humedad and not sensores_hum:
-        st.warning("No se detectaron sensores de humedad. El análisis continuará solo con temperatura.")
-        incluir_humedad = False
-        df_hum = pd.DataFrame(columns=["Timestamp"])
-        sensores_hum = []
+        if incluir_temperatura and sensores_temp:
+            st.warning("No se detectaron sensores de humedad. El análisis continuará solo con temperatura.")
+            incluir_humedad = False
+            df_hum = pd.DataFrame(columns=["Timestamp"])
+            sensores_hum = []
+        else:
+            st.error("No se detectaron columnas de sensores de humedad.")
+            safe_stop()
+            return
 
     sel_temp = list(sensores_temp)
     sel_hum = list(sensores_hum)
@@ -2726,6 +3028,11 @@ def main() -> None:
     habilitar_grupos = False
     contexto_titulos = ""
     umbral_hum_max: float | None = None
+    habilitar_umbral_temp = False
+    umbral_temp: float | None = None
+    habilitar_umbral_temp_extra = False
+    umbral_temp_extra: float | None = None
+    tipo_limite: str | None = None
 
     with st.sidebar:
         st.header("Panel de configuraciones")
@@ -2737,12 +3044,13 @@ def main() -> None:
         mostrar_config_sensores = st.checkbox("Mostrar configuración de sensores", value=False, key="toggle_config_sensores")
         if mostrar_config_sensores:
             st.subheader("Sensores incluidos")
-            sel_temp = st.multiselect(
-                "Sensores de temperatura",
-                sensores_temp,
-                default=sel_temp,
-                key="sel_temp_sidebar",
-            )
+            if incluir_temperatura and sensores_temp:
+                sel_temp = st.multiselect(
+                    "Sensores de temperatura",
+                    sensores_temp,
+                    default=sel_temp,
+                    key="sel_temp_sidebar",
+                )
             if incluir_humedad and sensores_hum:
                 sel_hum = st.multiselect(
                     "Sensores de humedad",
@@ -2757,18 +3065,19 @@ def main() -> None:
         habilitar_grupos = st.checkbox("Dividir sensores en Almacén / Stage / Maquila", value=False, key="toggle_grupos")
         if habilitar_grupos:
             st.caption("Selecciona los sensores para Stage y Maquila; el resto se asignará automáticamente a Almacén.")
-            grupos_temp_config["stage"] = st.multiselect(
-                "Temperatura · Stage",
-                sel_temp,
-                default=[],
-                key="grupo_stage_temp",
-            )
-            grupos_temp_config["maquila"] = st.multiselect(
-                "Temperatura · Maquila",
-                [s for s in sel_temp if s not in grupos_temp_config["stage"]],
-                default=[],
-                key="grupo_maquila_temp",
-            )
+            if incluir_temperatura and sel_temp:
+                grupos_temp_config["stage"] = st.multiselect(
+                    "Temperatura · Stage",
+                    sel_temp,
+                    default=[],
+                    key="grupo_stage_temp",
+                )
+                grupos_temp_config["maquila"] = st.multiselect(
+                    "Temperatura · Maquila",
+                    [s for s in sel_temp if s not in grupos_temp_config["stage"]],
+                    default=[],
+                    key="grupo_maquila_temp",
+                )
             if incluir_humedad and sel_hum:
                 grupos_hum_config["stage"] = st.multiselect(
                     "Humedad · Stage",
@@ -2856,15 +3165,17 @@ def main() -> None:
             value=DEFAULT_INTERVAL_MINUTES,
             step=1,
         )
-        umbral_temp = st.number_input("Umbral temperatura (°C)", value=20.0, step=0.5)
-        habilitar_umbral_temp_extra = st.checkbox("Agregar segundo umbral de temperatura", value=False)
-        umbral_temp_extra = None
-        if habilitar_umbral_temp_extra:
-            umbral_temp_extra = st.number_input(
-                "Segundo umbral de temperatura (°C)",
-                value=float(umbral_temp + 5.0),
-                step=0.5,
-            )
+        if incluir_temperatura and sensores_temp:
+            habilitar_umbral_temp = st.checkbox("Usar umbral de temperatura", value=True)
+            if habilitar_umbral_temp:
+                umbral_temp = st.number_input("Umbral temperatura (°C)", value=20.0, step=0.5)
+                habilitar_umbral_temp_extra = st.checkbox("Agregar segundo umbral de temperatura", value=False)
+                if habilitar_umbral_temp_extra:
+                    umbral_temp_extra = st.number_input(
+                        "Segundo umbral de temperatura (°C)",
+                        value=float(umbral_temp + 5.0),
+                        step=0.5,
+                    )
         if incluir_humedad and sensores_hum:
             habilitar_umbral_hum = st.checkbox("Agregar umbral máximo de humedad", value=False)
             if habilitar_umbral_hum:
@@ -2875,13 +3186,12 @@ def main() -> None:
                     value=80.0,
                     step=1.0,
                 )
-        tipo_limite: str | None = None
-        if habilitar_umbral_temp_extra:
+        if habilitar_umbral_temp and habilitar_umbral_temp_extra:
             st.caption(
                 "Con dos umbrales, el mayor se usa automáticamente como límite superior "
                 "y el menor como límite inferior."
             )
-        else:
+        elif habilitar_umbral_temp:
             tipo_limite_label = st.selectbox(
                 "Tipo de límite",
                 ("Mayor que (sobre límite)", "Menor que (bajo límite)"),
@@ -2898,15 +3208,21 @@ def main() -> None:
             )
         )
 
-    if not sel_temp:
+    if incluir_temperatura and not sel_temp:
         sel_temp = sensores_temp
+    if not incluir_temperatura:
+        sel_temp = []
     if incluir_humedad:
         if not sel_hum:
             sel_hum = sensores_hum
     else:
         sel_hum = []
 
-    grupos_temp = dividir_grupos(sel_temp, grupos_temp_config["stage"], grupos_temp_config["maquila"]) if habilitar_grupos else None
+    grupos_temp = (
+        dividir_grupos(sel_temp, grupos_temp_config["stage"], grupos_temp_config["maquila"])
+        if habilitar_grupos and incluir_temperatura and sel_temp
+        else None
+    )
     grupos_hum = (
         dividir_grupos(sel_hum, grupos_hum_config["stage"], grupos_hum_config["maquila"])
         if habilitar_grupos and incluir_humedad and sel_hum
@@ -2914,9 +3230,9 @@ def main() -> None:
     )
 
     umbrales_temp_monitoreo: list[float] = []
-    if umbral_temp is not None and np.isfinite(umbral_temp):
+    if habilitar_umbral_temp and umbral_temp is not None and np.isfinite(umbral_temp):
         umbrales_temp_monitoreo.append(float(umbral_temp))
-    if umbral_temp_extra is not None and np.isfinite(umbral_temp_extra):
+    if habilitar_umbral_temp and umbral_temp_extra is not None and np.isfinite(umbral_temp_extra):
         valor_extra = float(umbral_temp_extra)
         if valor_extra not in umbrales_temp_monitoreo:
             umbrales_temp_monitoreo.append(valor_extra)
@@ -2947,6 +3263,7 @@ def main() -> None:
     tab_monitoreo, tab_prueba = st.tabs(["Monitoreo", "Prueba"])
 
     with tab_monitoreo:
+        reporte_monitoreo = ReporteVista("Vista completa - Monitoreo")
         periodo_temp = (df_temp["Timestamp"].min(), df_temp["Timestamp"].max())
         periodo_hum = (
             (df_hum["Timestamp"].min(), df_hum["Timestamp"].max()) if sel_hum else (None, None)
@@ -2970,11 +3287,19 @@ def main() -> None:
             umbral_hum_max=umbral_hum_max,
             grupos_temp=grupos_temp,
             grupos_hum=grupos_hum,
+            mostrar_temperatura=bool(sel_temp),
             mostrar_humedad=bool(sel_hum),
+            reporte=reporte_monitoreo,
         )
+        render_descarga_reporte(reporte_monitoreo, "descarga_pdf_monitoreo", "vista_monitoreo")
 
     with tab_prueba:
-        df_temp_prueba, ti_temp, tf_temp = filtrar_rango(df_temp, fecha_ini, fecha_fin)
+        reporte_prueba = ReporteVista("Vista completa - Prueba")
+        if sel_temp:
+            df_temp_prueba, ti_temp, tf_temp = filtrar_rango(df_temp, fecha_ini, fecha_fin)
+        else:
+            df_temp_prueba = df_temp.copy()
+            ti_temp = tf_temp = None
         if sel_hum:
             df_hum_prueba, ti_hum, tf_hum = filtrar_rango(df_hum, fecha_ini, fecha_fin)
         else:
@@ -2999,12 +3324,13 @@ def main() -> None:
             umbral_hum_max=umbral_hum_max,
             grupos_temp=grupos_temp,
             grupos_hum=grupos_hum,
+            mostrar_temperatura=bool(sel_temp),
             mostrar_humedad=bool(sel_hum),
+            reporte=reporte_prueba,
         )
 
-        st.markdown("### Tendencia de temperatura con ventana de prueba")
-
         if (ti_temp is not None) and (tf_temp is not None) and sel_temp:
+            st.markdown("### Tendencia de temperatura con ventana de prueba")
             fig_temp_full = grafico_temp_prueba_full(
                 df_temp,
                 sel_temp,
@@ -3015,25 +3341,29 @@ def main() -> None:
                 lineas_umbral=lineas_temp_general,
             )
             if fig_temp_full is not None:
-                mostrar_figura(fig_temp_full)
+                titulo_fig = titulo_con_contexto("Tendencia de temperatura con ventana de prueba", contexto_general)
+                mostrar_figura(fig_temp_full, reporte_prueba, titulo_fig, key_suffix="prueba_temp_full")
 
+        if (ti_hum is not None) and (tf_hum is not None) and sel_hum:
             st.markdown("### Tendencia de humedad con ventana de prueba")
-            if (ti_hum is not None) and (tf_hum is not None) and sel_hum:
-                fig_hum_full = grafico_hum_prueba_full(
-                    df_hum,
-                    sel_hum,
-                    ti_hum,
-                    tf_hum,
-                    decimales_report,
-                    titulo_contexto=contexto_general,
-                    lineas_umbral=lineas_hum_general,
-                )
-                if fig_hum_full is not None:
-                    mostrar_figura(fig_hum_full)
+            fig_hum_full = grafico_hum_prueba_full(
+                df_hum,
+                sel_hum,
+                ti_hum,
+                tf_hum,
+                decimales_report,
+                titulo_contexto=contexto_general,
+                lineas_umbral=lineas_hum_general,
+            )
+            if fig_hum_full is not None:
+                titulo_fig = titulo_con_contexto("Tendencia de humedad con ventana de prueba", contexto_general)
+                mostrar_figura(fig_hum_full, reporte_prueba, titulo_fig, key_suffix="prueba_hum_full")
 
+        if sel_temp:
             configs_umbral = configuraciones_analisis_temperatura(umbrales_temp_monitoreo, tipo_limite)
             if len(configs_umbral) > 1:
                 st.markdown("### Análisis de umbrales (Prueba)")
+                reporte_prueba.add_heading("Análisis de umbrales (Prueba)")
 
             for etiqueta_umbral, umbral_eval, tipo_eval in configs_umbral:
                 analisis_prueba = None
@@ -3045,6 +3375,7 @@ def main() -> None:
                 )
                 if len(configs_umbral) > 1:
                     st.markdown(f"#### {etiqueta_umbral}: {fmt_num(umbral_eval, decimales_report)} °C")
+                    reporte_prueba.add_heading(f"{etiqueta_umbral}: {fmt_num(umbral_eval, decimales_report)} °C")
 
                 if ti_temp is not None and tf_temp is not None:
                     analisis_prueba = analizar_prueba(df_temp, sel_temp, ti_temp, tf_temp, umbral_eval, tipo_eval)
@@ -3062,7 +3393,9 @@ def main() -> None:
                     analisis_divisiones if analisis_divisiones else None,
                     contextos_division,
                     titulo=None if len(configs_umbral) > 1 else "Análisis de umbral (Prueba)",
+                    reporte=reporte_prueba,
                 )
+        render_descarga_reporte(reporte_prueba, "descarga_pdf_prueba", "vista_prueba")
     gc.collect()
 
 
